@@ -886,6 +886,18 @@ struct GateUpShared {
 
 static_assert(sizeof(GateUpShared<1>) + 1024 <= 102400 / 2, "two one-column gate/up CTAs must fit an SM");
 
+// Below sm_80 (the V100 + RTX 4090 fork's V100) the slice is read from global memory: the same layout
+// without the staged weights, so several CTAs fit an SM.
+template <int Columns>
+struct GateUpDirect {
+    union {
+        ActOf<Columns> acts[Columns * moe::kGateUpBlocks];
+        std::int64_t partial[kWarps][16 * kGateUpGroups][Columns];
+    };
+    std::uint16_t y[Columns][16 * kGateUpGroups];
+    std::uint16_t h[Columns][16];
+};
+
 template <int Columns>
 __global__ void __launch_bounds__(kThreads, Columns == 1 ? 2 : 1)
     gate_up_kernel(const bf16* __restrict__ x, int hidden, MoeDispatch dispatch,
@@ -893,7 +905,11 @@ __global__ void __launch_bounds__(kThreads, Columns == 1 ? 2 : 1)
                    const std::int32_t* __restrict__ cpu_flags, int job_base, canon::A4Block* __restrict__ h_blocks,
                    PassPhase phase) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
+#if INFERNIX_DEVICE_SM80
     auto& sm       = *reinterpret_cast<GateUpShared<Columns>*>(smem_raw);
+#else
+    auto& sm       = *reinterpret_cast<GateUpDirect<Columns>*>(smem_raw);
+#endif
     const int job  = job_base + static_cast<int>(blockIdx.y);
     if (job >= *dispatch.job_count || (cpu_flags != nullptr && cpu_flags[job] != 0)) { return; }
     const int expert = dispatch.jobs[job];
@@ -905,8 +921,14 @@ __global__ void __launch_bounds__(kThreads, Columns == 1 ? 2 : 1)
     if (moe::wide_route(count, scales)) { return; }
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     const bool split_input = scales.input_up != scales.input_gate;
-    stage_async(record + static_cast<std::size_t>(kGateUpGroups * slice) * moe::kGateUpBlocks * moe::kUnitBytes,
-                sm.stage, kGateUpSliceBytes);
+    const std::uint8_t* const slice_weights =
+        record + static_cast<std::size_t>(kGateUpGroups * slice) * moe::kGateUpBlocks * moe::kUnitBytes;
+#if INFERNIX_DEVICE_SM80
+    stage_async(slice_weights, sm.stage, kGateUpSliceBytes);
+    const std::uint8_t* const weights = sm.stage;
+#else
+    const std::uint8_t* const weights = slice_weights;
+#endif
 
     for (int pass = 0; pass < count; pass += Columns) {
         const int n = min(Columns, count - pass);
@@ -928,9 +950,9 @@ __global__ void __launch_bounds__(kThreads, Columns == 1 ? 2 : 1)
             __syncthreads();
             std::int64_t s[kGateUpGroups][Columns];
             if constexpr (Columns == 1) {
-                unit_sums_one<kGateUpGroups>(sm.stage, moe::kGateUpBlocks, sm.acts, s);
+                unit_sums_one<kGateUpGroups>(weights, moe::kGateUpBlocks, sm.acts, s);
             } else {
-                unit_sums<kGateUpGroups, Columns>(sm.stage, moe::kGateUpBlocks, 0, sm.acts, n, s);
+                unit_sums<kGateUpGroups, Columns>(weights, moe::kGateUpBlocks, 0, sm.acts, n, s);
             }
             __syncthreads(); // every warp has read sm.acts before sm.partial overwrites it
             if (lane < 16) {
@@ -972,13 +994,35 @@ struct DownShared {
 };
 
 template <int Columns>
+struct DownDirect {
+    ActOf<Columns> acts[Columns * kHBlocks];
+    std::int64_t partial[kWarps][16 * kDownGroups][Columns];
+};
+
+// The dynamic shared memory of the narrow kernels on the current device (staged slice from sm_80 on).
+template <int Columns>
+int gate_up_shared_bytes() {
+    return current_device_compute_major() >= 8 ? static_cast<int>(sizeof(GateUpShared<Columns>))
+                                               : static_cast<int>(sizeof(GateUpDirect<Columns>));
+}
+template <int Columns>
+int down_shared_bytes() {
+    return current_device_compute_major() >= 8 ? static_cast<int>(sizeof(DownShared<Columns>))
+                                               : static_cast<int>(sizeof(DownDirect<Columns>));
+}
+
+template <int Columns>
 __global__ void __launch_bounds__(kThreads)
     down_kernel(MoeDispatch dispatch, MoeExpertSource source, int hidden,
                 const std::uint8_t* const* __restrict__ job_records, const std::int32_t* __restrict__ cpu_flags,
                 int job_base, const canon::A4Block* __restrict__ h_blocks, int columns_out,
                 bf16* __restrict__ outputs, PassPhase phase) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
+#if INFERNIX_DEVICE_SM80
     auto& sm      = *reinterpret_cast<DownShared<Columns>*>(smem_raw);
+#else
+    auto& sm      = *reinterpret_cast<DownDirect<Columns>*>(smem_raw);
+#endif
     const int job = job_base + static_cast<int>(blockIdx.y);
     const int tile = blockIdx.x; // down row groups 4*tile .. 4*tile+3
     // Launched as a programmatic dependent of the gate/up pass: everything read before the PDL wait (the
@@ -998,10 +1042,16 @@ __global__ void __launch_bounds__(kThreads)
         count  = dispatch.offsets[expert + 1] - first;
         if (moe::wide_route(count, scales)) { record = nullptr; }
     }
+    const std::uint8_t* weights = nullptr;
     if (record != nullptr) {
-        stage_async(record + moe::kGateUpBytes +
-                        static_cast<std::size_t>(kDownGroups * tile) * moe::kDownBlocks * moe::kUnitBytes,
-                    sm.stage, kDownSliceBytes);
+        const std::uint8_t* const tile_weights =
+            record + moe::kGateUpBytes + static_cast<std::size_t>(kDownGroups * tile) * moe::kDownBlocks * moe::kUnitBytes;
+#if INFERNIX_DEVICE_SM80
+        stage_async(tile_weights, sm.stage, kDownSliceBytes);
+        weights = sm.stage;
+#else
+        weights = tile_weights;
+#endif
     }
     pdl::wait_for_dependencies();
     if (record == nullptr) { return; }
@@ -1021,9 +1071,9 @@ __global__ void __launch_bounds__(kThreads)
         __syncthreads();
         std::int64_t s[kDownGroups][Columns];
         if constexpr (Columns == 1) {
-            unit_sums_one<kDownGroups>(sm.stage, moe::kDownBlocks, sm.acts, s);
+            unit_sums_one<kDownGroups>(weights, moe::kDownBlocks, sm.acts, s);
         } else {
-            unit_sums<kDownGroups, Columns>(sm.stage, moe::kDownBlocks, 0, sm.acts, n, s);
+            unit_sums<kDownGroups, Columns>(weights, moe::kDownBlocks, 0, sm.acts, n, s);
         }
         if (lane < 16) {
 #pragma unroll
@@ -1066,11 +1116,12 @@ void launch_expert_pass(const bf16* x, const MoeDispatch& dispatch, const MoeExp
             cudaFuncSetAttribute(down_kernel<Columns>, cudaFuncAttributePreferredSharedMemoryCarveout,
                                          cudaSharedmemCarveoutMaxShared);
     }
-    gate_up_kernel<Columns><<<dim3(kGateUpCtas, jobs), kThreads, sizeof(GateUpShared<Columns>), stream>>>(
+    gate_up_kernel<Columns><<<dim3(kGateUpCtas, jobs), kThreads, gate_up_shared_bytes<Columns>(), stream>>>(
         x, moe::kHidden, dispatch, source, top_k, job_records, flags, base, h_blocks, phase);
     check_launch("gate/up");
     // A programmatic dependent of the gate/up pass in captured graphs (down_kernel's PDL contract).
-    CUDA_CHECK(pdl::launch_consumer({dim3(kDownCtas, jobs), dim3(kThreads), sizeof(DownShared<Columns>), stream},
+    CUDA_CHECK(pdl::launch_consumer({dim3(kDownCtas, jobs), dim3(kThreads),
+                                     static_cast<std::size_t>(down_shared_bytes<Columns>()), stream},
                                     down_kernel<Columns>, dispatch, source, static_cast<int>(moe::kHidden), job_records,
                                     flags, base, static_cast<const canon::A4Block*>(h_blocks), columns_out, outputs,
                                     phase));
