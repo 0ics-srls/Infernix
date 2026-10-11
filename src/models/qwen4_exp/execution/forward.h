@@ -76,6 +76,8 @@ struct ForwardExperts {
     // experts without a CPU job are read through.
     std::vector<const std::uint8_t* const*> host_tables;
     std::vector<ops::MoeFetchChannel> fetch;
+    // The V100 + RTX 4090 pair: per layer, the channel to the second GPU's expert service (empty: none).
+    std::vector<ops::MoeRemoteChannel> remote;
     // Mapped word a call that could not serve an expert writes (ops::MoeExpertSource::error); the
     // Program checks it after each synchronization. Null: none.
     std::uint32_t* error = nullptr;

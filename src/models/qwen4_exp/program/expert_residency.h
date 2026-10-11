@@ -129,6 +129,9 @@ public:
     // SSD tier mode: records come from `tier` (owned by the caller, outliving this), not the banks.
     // Before the first round and before warm_start.
     void attach_tier(HostExpertTier* tier);
+    // The keys a second GPU holds (one flag per layer * experts + expert; empty: none). The SSD
+    // tier's ranking leaves them out (the V100 + RTX 4090 pair, ops/offloaded_sparse_moe/cuda/remote_experts.h).
+    void set_remote_held(std::vector<std::uint8_t> held) { remote_held_ = std::move(held); }
     [[nodiscard]] bool tiered() const noexcept { return tier_ != nullptr; }
     // Layer l's host record pointers (device [E]; null entries: SSD-only), or null without a tier.
     [[nodiscard]] const std::uint8_t* const* record_table(std::uint32_t layer) const noexcept;
@@ -251,6 +254,7 @@ private:
     Stats stats_;
 
     HostExpertTier* tier_ = nullptr;
+    std::vector<std::uint8_t> remote_held_; // per key: held by the second GPU
     expert_cache::LfruPolicy::Admissible admissible_;
     DeviceBuffer records_device_;       // tier: const uint8_t* [layers][experts]
     PinnedHostBuffer records_host_{1};

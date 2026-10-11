@@ -39,6 +39,7 @@
 #include "models/qwen4_exp/program/vram_monitor.h"
 #include "ops/offloaded_sparse_moe/cpu/fetch_channel.h"
 #include "ops/offloaded_sparse_moe/cpu/miss_service.h"
+#include "ops/offloaded_sparse_moe/cuda/remote_experts.h"
 #include "infernix/ops/argmax.h"
 #include "infernix/ops/cast.h"
 #include "infernix/ops/gdn_replay.h"
@@ -57,6 +58,7 @@
 #include <cstdio>
 #include <cerrno>
 #include <cstdlib>
+#include <fstream>
 #include <cstring>
 #include <functional>
 #include <mutex>
@@ -810,6 +812,9 @@ public:
         expert_error_ = PinnedHostBuffer(64);
         std::memset(expert_error_.data(), 0, 64);
         experts.error = static_cast<std::uint32_t*>(expert_error_.data());
+        // The V100 + RTX 4090 pair: a second GPU's expert service (its records load before the warm
+        // start, once the expert cache's size is known).
+        create_remote_experts(experts);
         if (options_.prefill_stream && options_.expert_cache) {
             execution::ExpertStream::RecordOf record_of;
             if (tier_) {
@@ -916,6 +921,7 @@ public:
                 experts.fetch.push_back(fetch_channel_->channel(static_cast<int>(l)));
             }
         }
+        load_remote_experts();
         warm_start_experts();
         if (!options_.route_trace.empty()) {
             trace_ = std::make_unique<RouteTrace>(
@@ -2163,11 +2169,165 @@ public:
     // Fills the frames from the saved state, before the first request. With the SSD tier, RAM is
     // filled first (the frames load from it), then the seeds' RAM copies are released and their slots
     // refilled with the next keys of the fill order, so the two levels hold different experts.
+    // ---- the second GPU's experts (the V100 + RTX 4090 pair) ----
+    // INFERNIX_REMOTE_EXPERT_DEVICE=N: CUDA device N holds and computes routed experts
+    // (ops/offloaded_sparse_moe/cuda/remote_experts.h). INFERNIX_EXPERT_PROFILE=FILE: the experts'
+    // routing-frequency ranking (Strata's STRP v1 profile: (layer, expert) pairs, most routed first),
+    // which divides them: the most routed stay with this GPU's expert cache (and RAM, its source),
+    // the next ones go to the second GPU, the rest stay in RAM for the CPU and the link.
+    // INFERNIX_REMOTE_EXPERT_RESERVE_MIB: memory the second GPU keeps free (default 1536).
+    void create_remote_experts(execution::ForwardExperts& experts) {
+        const char* device_env = std::getenv("INFERNIX_REMOTE_EXPERT_DEVICE");
+        if (device_env == nullptr || *device_env == '\0') { return; }
+        const int device = std::stoi(device_env);
+        if (device == device_.device) {
+            throw std::invalid_argument("INFERNIX_REMOTE_EXPERT_DEVICE names the Program's own GPU");
+        }
+        if (const char* profile = std::getenv("INFERNIX_EXPERT_PROFILE"); profile != nullptr && *profile != '\0') {
+            profile_ = read_expert_profile(profile);
+        }
+        ops::offloaded_moe::RemoteExpertService::Options o;
+        o.device        = device;
+        o.main_device   = device_.device;
+        o.layers        = c_.num_hidden_layers;
+        o.experts       = c_.moe.experts;
+        o.record_stride = residency_->frame_stride();
+        o.activation    = parameters_.layers.front().moe.bank->activation;
+        for (const auto& layer : parameters_.layers) { o.scales.push_back(layer.moe.bank->scales.data()); }
+        if (const char* r = std::getenv("INFERNIX_REMOTE_EXPERT_RESERVE_MIB"); r != nullptr && *r != '\0') {
+            o.reserve_bytes = std::stoull(r) << 20;
+        }
+        remote_ = std::make_unique<ops::offloaded_moe::RemoteExpertService>(std::move(o));
+        for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) {
+            experts.remote.push_back(remote_->channel(static_cast<int>(l)));
+        }
+        char line[200];
+        std::snprintf(line, sizeof(line), "second GPU (CUDA %d): room for %u experts (%.1f GiB)", device,
+                      remote_->capacity(),
+                      static_cast<double>(remote_->capacity()) * residency_->frame_stride() / (1ULL << 30));
+        diagnostic(line);
+    }
+
+    // Strata's expert profile (STRP, version 1): magic, then version, layers, experts, slots, ranked
+    // count (u32), then the ranked (layer, expert) pairs (u16 each), most routed first.
+    [[nodiscard]] std::vector<std::uint32_t> read_expert_profile(const std::filesystem::path& path) const {
+        std::ifstream in(path, std::ios::binary);
+        char magic[4] = {};
+        std::uint32_t header[5] = {};
+        if (!in.read(magic, 4) || !in.read(reinterpret_cast<char*>(header), sizeof(header)) ||
+            std::memcmp(magic, "STRP", 4) != 0 || header[0] != 1) {
+            throw std::runtime_error("expert profile " + path.string() + ": not a version 1 STRP profile");
+        }
+        if (header[1] != c_.num_hidden_layers || header[2] != c_.moe.experts) {
+            throw std::runtime_error("expert profile " + path.string() + ": " + std::to_string(header[1]) + "x" +
+                                     std::to_string(header[2]) + " experts, the model has " +
+                                     std::to_string(c_.num_hidden_layers) + "x" + std::to_string(c_.moe.experts));
+        }
+        std::vector<std::uint16_t> pairs(static_cast<std::size_t>(header[4]) * 2);
+        if (!in.read(reinterpret_cast<char*>(pairs.data()), static_cast<std::streamsize>(pairs.size() * 2))) {
+            throw std::runtime_error("expert profile " + path.string() + ": truncated");
+        }
+        std::vector<std::uint32_t> keys;
+        std::vector<std::uint8_t> listed(static_cast<std::size_t>(c_.num_hidden_layers) * c_.moe.experts, 0);
+        for (std::size_t i = 0; i < header[4]; ++i) {
+            const std::uint32_t layer = pairs[2 * i], expert = pairs[2 * i + 1];
+            if (layer >= c_.num_hidden_layers || expert >= c_.moe.experts) { continue; }
+            const std::uint32_t key = layer * c_.moe.experts + expert;
+            if (listed[key] == 0) {
+                keys.push_back(key);
+                listed[key] = 1;
+            }
+        }
+        return keys;
+    }
+
+    // The full ranking: the profile, then every key it lacks, one expert of every layer in turn.
+    [[nodiscard]] std::vector<std::uint32_t> expert_ranking() const {
+        const std::uint32_t layers = c_.num_hidden_layers, experts = c_.moe.experts, keys = layers * experts;
+        std::vector<std::uint32_t> rank = profile_;
+        std::vector<std::uint8_t> listed(keys, 0);
+        for (const std::uint32_t key : rank) { listed[key] = 1; }
+        for (std::uint32_t i = 0; i < keys; ++i) {
+            const std::uint32_t key = (i % layers) * experts + i / layers;
+            if (listed[key] == 0) { rank.push_back(key); }
+        }
+        return rank;
+    }
+
+    // Loads the second GPU's experts: the ranks right after the ones this GPU's cache holds, as many
+    // as fit; records come from the artifact (SSD tier) or the pinned banks.
+    void load_remote_experts() {
+        if (!remote_) { return; }
+        const auto start           = std::chrono::steady_clock::now();
+        const std::uint32_t layers = c_.num_hidden_layers, experts = c_.moe.experts, keys = layers * experts;
+        if (profile_.empty()) {
+            diagnostic("second GPU: no expert profile (INFERNIX_EXPERT_PROFILE), so its experts are spread across the "
+                       "layers instead of ranked by routing frequency", DiagnosticLevel::Warning);
+        }
+        const std::vector<std::uint32_t> rank = expert_ranking();
+        const std::uint32_t first = std::min<std::uint32_t>(residency_->frames(), keys);
+        const std::uint32_t count = std::min<std::uint32_t>(remote_->capacity(), keys - first);
+        std::vector<std::uint32_t> chosen(rank.begin() + first, rank.begin() + first + count);
+        std::sort(chosen.begin(), chosen.end()); // artifact order: sequential reads
+        const std::uint64_t stride = residency_->frame_stride();
+        const auto& store          = parameters_.model.expert_store();
+        std::vector<std::ifstream> files;
+        if (store.has_value()) {
+            for (const auto& path : store->files()) { files.emplace_back(path, std::ios::binary); }
+        }
+        const auto read = [&](std::uint32_t key, std::uint8_t* destination) {
+            const std::uint32_t layer = key / experts, expert = key % experts;
+            if (store.has_value()) {
+                for (const auto& segment : store->segments(layer, expert)) {
+                    auto& file = files.at(segment.file);
+                    file.seekg(static_cast<std::streamoff>(segment.offset));
+                    if (!file.read(reinterpret_cast<char*>(destination) + segment.at, segment.bytes)) {
+                        throw std::runtime_error("second GPU: reading an expert record from the artifact failed");
+                    }
+                }
+            } else {
+                const auto* bank = reinterpret_cast<const std::uint8_t*>(parameters_.layers[layer].moe.bank->planes.records);
+                std::memcpy(destination, bank + static_cast<std::size_t>(expert) * stride, stride);
+            }
+        };
+        remote_->load(chosen, read);
+        std::vector<std::uint8_t> held(keys, 0);
+        for (const std::uint32_t key : chosen) { held[key] = 1; }
+        residency_->set_remote_held(std::move(held));
+        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        char line[300];
+        std::snprintf(line, sizeof(line),
+                      "second GPU: holds %u experts (%.1f GiB), routing-frequency ranks %u-%u (this GPU's cache "
+                      "takes ranks below %u), loaded in %.1f s",
+                      remote_->held(), static_cast<double>(remote_->held()) * stride / (1ULL << 30), first,
+                      first + count, first, seconds);
+        diagnostic(line);
+    }
+
+    // The profile as a saved state, for the warm start when no session state was saved: this GPU's
+    // cache takes the top ranks the second GPU does not hold, every key counts by its rank.
+    [[nodiscard]] expert_cache::SavedState profile_state() const {
+        const std::uint32_t keys = c_.num_hidden_layers * c_.moe.experts;
+        expert_cache::SavedState state;
+        state.counts.assign(keys, 0);
+        const std::vector<std::uint32_t> rank = expert_ranking();
+        for (std::uint32_t i = 0; i < rank.size(); ++i) { state.counts[rank[i]] = keys - i; }
+        const std::uint32_t top = std::min<std::uint32_t>(residency_->frames(), keys);
+        for (std::uint32_t i = 0; i < top; ++i) {
+            if (!remote_ || !remote_->holds(rank[i])) { state.ranked.push_back(rank[i]); }
+        }
+        return state;
+    }
+
     void warm_start_experts() {
         const auto keys = c_.num_hidden_layers * c_.moe.experts;
         expert_cache::ExpertStateLoad load;
         if (!options_.expert_state.empty() && options_.expert_cache) {
             load = expert_cache::load_expert_state(options_.expert_state, options_.expert_state_identity, keys);
+        }
+        if (!load.state && !profile_.empty() && options_.expert_cache) {
+            load.state = profile_state();
+            diagnostic("expert cache: no saved state, so the warm start follows the expert profile");
         }
         const expert_cache::SavedState* state = load.state ? &*load.state : nullptr;
         TierFill fill;
@@ -2223,6 +2383,8 @@ private:
             const std::uint32_t key = (i % layers) * experts + i / layers; // spread(key) == i
             if (listed[key] == 0) { order.push_back(key); }
         }
+        // The second GPU's experts need no RAM: it computes them (the V100 + RTX 4090 pair).
+        if (remote_) { std::erase_if(order, [&](std::uint32_t key) { return remote_->holds(key); }); }
         return order;
     }
 
@@ -2270,7 +2432,7 @@ private:
 
     // The frames' warm start from the saved state; returns how many experts it loaded.
     std::uint32_t warm_start_frames(const expert_cache::ExpertStateLoad& load) {
-        if (options_.expert_state.empty() || !options_.expert_cache) { return 0; }
+        if (!options_.expert_cache || (options_.expert_state.empty() && !load.state)) { return 0; }
         if (!load.state) {
             diagnostic("expert cache: no saved state yet, so it starts empty and fills as requests arrive");
             diagnostic("expert cache starts empty: " + load.message, DiagnosticLevel::Debug);
@@ -4205,6 +4367,10 @@ private:
     [[nodiscard]] bool prefix_tap_due(const Lane& lane, std::size_t next_call) const;
     std::unique_ptr<RouteTrace> trace_;
     std::unique_ptr<ops::offloaded_moe::CpuMissService> cpu_service_;
+    // The V100 + RTX 4090 pair: the second GPU's expert service, and the routing-frequency ranking
+    // (keys, most routed first) that divides the experts between the GPUs and RAM.
+    std::unique_ptr<ops::offloaded_moe::RemoteExpertService> remote_;
+    std::vector<std::uint32_t> profile_;
 
     // ---- prefill CPU split (design §19.3.12) ----
     // Gives the CPU the thinnest non-resident experts of a layer while the link carries the rest:

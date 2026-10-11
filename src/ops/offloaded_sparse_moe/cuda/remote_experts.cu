@@ -212,8 +212,7 @@ void RemoteExpertService::load(std::span<const std::uint32_t> keys, const Read& 
 }
 
 MoeRemoteChannel RemoteExpertService::channel(int layer) const {
-    MoeRemoteChannel out;
-    if (held_ == 0) { return out; } // held == nullptr: the channel is off
+    MoeRemoteChannel out; // the held tables hold -1 until load(): no remote jobs before it
     out.held      = held_tables_ + static_cast<std::size_t>(layer) * options_.experts;
     out.request   = request_;
     out.x         = x_;

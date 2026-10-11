@@ -460,7 +460,13 @@ void ExpertResidency::after_round(cudaStream_t compute, std::int32_t columns, st
             seen_[expert] = 1;
             group_.push_back(layer * experts_ + expert);
         }
-        if (tier_ != nullptr) { uses_.insert(uses_.end(), group_.begin(), group_.end()); }
+        if (tier_ != nullptr) {
+            // Experts a second GPU holds (set_remote_held) are served there and never need RAM: they
+            // do not rank in the tier, so it neither reads them from the SSD nor evicts for them.
+            for (const auto key : group_) {
+                if (remote_held_.empty() || remote_held_[key] == 0) { uses_.push_back(key); }
+            }
+        }
         for (const auto key : group_) {
             seen_[key - layer * experts_] = 0;
             ++stats_.routed;
