@@ -100,10 +100,24 @@ __device__ __forceinline__ void stage_async(const std::uint8_t* src, std::uint8_
     }
     asm volatile("cp.async.commit_group;\n" ::: "memory");
 #else
-    // sm_70 (the V100's expert service): plain 16-byte copies; the callers' barrier after
-    // stage_wait() publishes them to the CTA as it does the asynchronous ones.
-    for (int i = static_cast<int>(threadIdx.x) * 16; i < bytes; i += static_cast<int>(blockDim.x) * 16) {
-        *reinterpret_cast<uint4*>(dst + i) = __ldcg(reinterpret_cast<const uint4*>(src + i));
+    // sm_70 (the V100's expert service): plain 16-byte copies, each thread's loads issued in batches
+    // of eight before their stores so the slice is in flight at once (one load waited for at a time
+    // made the copy latency-bound); the callers' barrier after stage_wait() publishes them to the CTA
+    // as it does the asynchronous ones.
+    constexpr int kBatch = 8;
+    const int step       = static_cast<int>(blockDim.x) * 16;
+    for (int base = static_cast<int>(threadIdx.x) * 16; base < bytes; base += kBatch * step) {
+        uint4 v[kBatch];
+#pragma unroll
+        for (int k = 0; k < kBatch; ++k) {
+            const int i = base + k * step;
+            if (i < bytes) { v[k] = __ldcg(reinterpret_cast<const uint4*>(src + i)); }
+        }
+#pragma unroll
+        for (int k = 0; k < kBatch; ++k) {
+            const int i = base + k * step;
+            if (i < bytes) { *reinterpret_cast<uint4*>(dst + i) = v[k]; }
+        }
     }
 #endif
 }
