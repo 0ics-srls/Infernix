@@ -39,3 +39,14 @@ target_link_libraries(infernix_ops PUBLIC infernix_offloaded_moe_cuda)
 target_sources(infernix_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/cpu/miss_service.cpp")
 # The host side of the SSD tier's fetch channel: mapped request/response words and the responder.
 target_sources(infernix_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/cpu/fetch_channel.cpp")
+
+# The second GPU's expert service on one GPU, for profiling its kernels (not built by default).
+add_executable(infernix_remote_experts_bench EXCLUDE_FROM_ALL
+  "${PROJECT_SOURCE_DIR}/bench/ops/remote_experts_bench.cu")
+infernix_internal_includes(infernix_remote_experts_bench)
+set_target_properties(infernix_remote_experts_bench PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "89")
+  set_target_properties(infernix_remote_experts_bench PROPERTIES CUDA_ARCHITECTURES "70;89")
+endif()
+target_link_libraries(infernix_remote_experts_bench PRIVATE infernix_offloaded_moe_cuda infernix_core
+                      infernix_cuda_runtime CUDA::cuda_driver)
