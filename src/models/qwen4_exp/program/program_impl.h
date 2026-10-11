@@ -2601,6 +2601,17 @@ private:
                           s.routed ? 100.0 * static_cast<double>(s.hits) / static_cast<double>(s.routed) : 0.0,
                           free_vram >> 20);
             diagnostic(text, DiagnosticLevel::Debug);
+            if (remote_) {
+                const auto r = remote_->stats();
+                std::snprintf(text, sizeof(text),
+                              "second GPU: since start %llu requests, %llu experts, %llu expert columns, %.1f us per "
+                              "request (request seen to answer written), %.2f s busy",
+                              static_cast<unsigned long long>(r.requests), static_cast<unsigned long long>(r.jobs),
+                              static_cast<unsigned long long>(r.entries),
+                              r.requests ? 1e-3 * static_cast<double>(r.busy_ns) / static_cast<double>(r.requests) : 0.0,
+                              1e-9 * static_cast<double>(r.busy_ns));
+                diagnostic(text, DiagnosticLevel::Debug);
+            }
             if (tier_) {
                 // The tier's counters as of the last round boundary.
                 const auto& t = tier_->stats();
