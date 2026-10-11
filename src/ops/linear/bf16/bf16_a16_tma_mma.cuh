@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ops/common/arch.cuh"
+
 #include "core/tma_descriptor_staging.cuh"
 #include "ops/common/mbarrier.cuh"
 #include "ops/linear/bf16/bf16_mma_common.cuh"
@@ -74,19 +76,27 @@ template <class Schedule>
 __device__ __forceinline__ void bf16_tma_load(void* destination, const CUtensorMap* map,
                                               int k_sector, int row, std::uint64_t* barrier) {
     if constexpr (bf16_predicated_k<Schedule>) {
+#if INFERNIX_DEVICE_SM90
         asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes "
                      "[%0], [%1, {%2, %3}], [%4];"
                      :
                      : "r"(smem_addr(destination)), "l"(map), "r"(k_sector * 64), "r"(row),
                        "r"(smem_addr(barrier))
                      : "memory");
+#else
+        __trap();
+#endif
     } else {
+#if INFERNIX_DEVICE_SM90
         asm volatile("cp.async.bulk.tensor.3d.shared::cta.global.tile.mbarrier::complete_tx::bytes "
                      "[%0], [%1, {%2, %3, %4}], [%5];"
                      :
                      : "r"(smem_addr(destination)), "l"(map), "r"(0), "r"(k_sector), "r"(row),
                        "r"(smem_addr(barrier))
                      : "memory");
+#else
+        __trap();
+#endif
     }
 }
 

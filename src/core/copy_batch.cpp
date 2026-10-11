@@ -26,8 +26,15 @@ void CopyBatch::flush() {
     cudaMemcpyAttributes attributes{};
     attributes.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
     std::size_t first         = 0;
+#if CUDART_VERSION >= 13000
     CUDA_CHECK(cudaMemcpyBatchAsync(destinations_.data(), sources_.data(), sizes_.data(), sizes_.size(), &attributes,
                                     &first, 1, stream_));
+#else
+    // CUDA 12.8-12.9 (sm_70/sm_89 builds): the same call with the failure index before the stream.
+    std::size_t fail_index = 0;
+    CUDA_CHECK(cudaMemcpyBatchAsync(destinations_.data(), const_cast<void**>(sources_.data()), sizes_.data(),
+                                    sizes_.size(), &attributes, &first, 1, &fail_index, stream_));
+#endif
     destinations_.clear();
     sources_.clear();
     sizes_.clear();

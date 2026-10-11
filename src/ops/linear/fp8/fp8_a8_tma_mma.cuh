@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ops/common/arch.cuh"
+
 #include "core/tma_descriptor_staging.cuh"
 #include "ops/common/mbarrier.cuh"
 #include "ops/common/math.h"
@@ -87,11 +89,15 @@ inline CUtensorMap fp8_tma_map(const std::uint8_t* pointer, int rows, int k, int
 
 __device__ __forceinline__ void fp8_tma_load(void* destination, const CUtensorMap* map, int k,
                                              int row, std::uint64_t* barrier) {
+#if INFERNIX_DEVICE_SM90
     asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes "
                  "[%0], [%1, {%2, %3}], [%4];"
                  :
                  : "r"(smem_addr(destination)), "l"(map), "r"(k), "r"(row), "r"(smem_addr(barrier))
                  : "memory");
+#else
+    __trap();
+#endif
 }
 
 template <class Schedule, class Epilogue>

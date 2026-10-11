@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ops/common/arch.cuh"
+
 #include "core/tma_descriptor_staging.cuh"
 #include "ops/common/mbarrier.cuh"
 #include "ops/common/memory.cuh"
@@ -142,12 +144,16 @@ __device__ __forceinline__ void nvfp4_tma_load_2d(void* destination, const CUten
                                                   std::int32_t coordinate0,
                                                   std::int32_t coordinate1,
                                                   std::uint64_t* barrier) {
+#if INFERNIX_DEVICE_SM90
     asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes "
                  "[%0], [%1, {%2, %3}], [%4];"
                  :
                  : "r"(smem_addr(destination)), "l"(descriptor), "r"(coordinate0), "r"(coordinate1),
                    "r"(smem_addr(barrier))
                  : "memory");
+#else
+    __trap();
+#endif
 }
 
 template <class Schedule, class Epilogue, class OutputPolicy, class Rows>
@@ -196,7 +202,11 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
 
     if (threadIdx.x < Schedule::kProducerThreads) {
         if constexpr (Schedule::kProducerThreads == 128) {
+#if INFERNIX_DEVICE_SM90
             asm volatile("setmaxnreg.dec.sync.aligned.u32 40;" : : : "memory");
+#else
+            __trap();
+#endif
         }
         if (threadIdx.x == 0) {
 #ifdef _WIN32
@@ -261,7 +271,11 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
     }
 
     if constexpr (Schedule::kProducerThreads == 128) {
+#if INFERNIX_DEVICE_SM90
         asm volatile("setmaxnreg.inc.sync.aligned.u32 232;" : : : "memory");
+#else
+        __trap();
+#endif
     }
     auto& tensors             = shared.scratch.tensors;
     const int consumer_thread = static_cast<int>(threadIdx.x) - Schedule::kProducerThreads;

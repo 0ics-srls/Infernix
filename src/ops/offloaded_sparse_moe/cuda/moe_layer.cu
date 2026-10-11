@@ -9,6 +9,7 @@
 // Experts with more than eight columns in a call take the tensor-core wide route instead
 // (wide_expert.h); these kernels skip them.
 
+#include "ops/common/arch.cuh"
 #include "infernix/ops/offloaded_sparse_moe.h"
 
 #include "core/device.h"
@@ -716,7 +717,22 @@ __device__ __forceinline__ ActCodes act_codes_of(const canon::A4Block& a) {
 }
 
 // The four bytes of a word converted from E2M1 pairs to half2 (low nibble in .x).
+// The FP16 bits of one E2M1 code (sm_89 has no cvt.f16x2.e2m1x2): every E2M1 value is exact in FP16,
+// so this equals the conversion bit for bit, -0 included.
+__device__ __forceinline__ std::uint32_t e2m1_code_to_half_bits(std::uint32_t n) {
+    const std::uint32_t e = (n >> 1) & 3U, m = n & 1U, sign = (n & 8U) << 12;
+    const std::uint32_t magnitude = e != 0 ? ((e + 14U) << 10) | (m << 9) : (m != 0 ? 0x3800U : 0U);
+    return magnitude | sign;
+}
+
 __device__ __forceinline__ void e2m1x2_word_to_half2(std::uint32_t word, std::uint32_t (&h)[4]) {
+#if !INFERNIX_DEVICE_SM120
+#pragma unroll
+    for (int b = 0; b < 4; ++b) {
+        const std::uint32_t byte = (word >> (8 * b)) & 0xFFU;
+        h[b] = e2m1_code_to_half_bits(byte & 0xFU) | (e2m1_code_to_half_bits(byte >> 4) << 16);
+    }
+#else
     asm("{\n\t.reg .b8 b0, b1, b2, b3;\n\t"
         "mov.b32 {b0, b1, b2, b3}, %4;\n\t"
         "cvt.rn.f16x2.e2m1x2 %0, b0;\n\t"
@@ -725,6 +741,7 @@ __device__ __forceinline__ void e2m1x2_word_to_half2(std::uint32_t word, std::ui
         "cvt.rn.f16x2.e2m1x2 %3, b3;\n\t}"
         : "=r"(h[0]), "=r"(h[1]), "=r"(h[2]), "=r"(h[3])
         : "r"(word));
+#endif
 }
 
 // Lane l = 8q + i's integer shares (P_q of rows i and i + 8) of one unit against one activation word.
@@ -1530,8 +1547,11 @@ __device__ void warm_l2(const MoeL2Warm& warm, int w) {
         std::size_t piece = end - at < static_cast<std::size_t>(kWarmPiece) ? end - at : static_cast<std::size_t>(kWarmPiece);
         piece             = piece < left ? piece : left;
         const auto* address = static_cast<const std::uint8_t*>(warm.ptr[span]) + offset;
+#if INFERNIX_DEVICE_SM90
         asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(address), "r"(static_cast<unsigned>(piece))
                      : "memory");
+#else
+#endif
     }
 }
 

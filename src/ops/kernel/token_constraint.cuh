@@ -54,7 +54,8 @@ __launch_bounds__(BlockSize) __global__
     if (n == 0) { return; }
 
     __nv_bfloat16* values = logits + static_cast<std::int64_t>(column) * physical_rows;
-    const TargetLogprobsColumn full = target_logprobs_column<BlockSize>(values, valid_rows);
+    __shared__ TargetLogprobsShared<BlockSize> lse_shared;
+    const TargetLogprobsColumn full = target_logprobs_column<BlockSize>(values, valid_rows, lse_shared);
 
     if (threadIdx.x == 0) {
         float maximum = -CUDART_INF_F;

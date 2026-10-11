@@ -59,7 +59,10 @@ public:
     // Computes every job; returns when all outputs are written. Not reentrant. The calling thread
     // advances `heartbeat` after each item it completes, so a long round stays alive to the device
     // while a hung worker (worker 0 then waits at a barrier) still stops it.
-    void run(std::span<const CpuExpertJob> jobs, Heartbeat heartbeat = {});
+    void run(std::span<const CpuExpertJob> jobs, Heartbeat heartbeat);
+    // Without a heartbeat. GCC rejects a default argument that value-initializes a nested class with
+    // member initializers inside the enclosing class, so this is an overload.
+    void run(std::span<const CpuExpertJob> jobs);
 
     [[nodiscard]] int workers() const { return workers_; }
     [[nodiscard]] CpuIsa isa() const { return isa_; }

@@ -15,13 +15,25 @@ namespace infernix::ops {
 
 inline constexpr int kTargetLogprobsBlock = 256;
 
+// The column reduction's shared memory, declared by each kernel that uses it. Shared variables
+// declared inside these helpers would be one weak symbol referenced by three kernels in different
+// translation units, which nvlink (RDC, sm_89) places past the kernels' own data: 48 KiB over the
+// static limit. Kernel-scope storage keeps every kernel's layout its own.
 template <int BlockSize>
-__device__ __forceinline__ float target_logprobs_block_max(float value) {
+struct TargetLogprobsShared {
+    float warp_maxima[BlockSize / kWarpSize];
+    float result;
+    float warp_sums[BlockSize / kWarpSize];
+    float log_sum;
+};
+
+template <int BlockSize>
+__device__ __forceinline__ float target_logprobs_block_max(float value, TargetLogprobsShared<BlockSize>& shared) {
     static_assert(BlockSize >= kWarpSize && BlockSize <= 1024);
     static_assert((BlockSize & (BlockSize - 1)) == 0);
     constexpr int kWarps = BlockSize / kWarpSize;
-    __shared__ float warp_maxima[kWarps];
-    __shared__ float result;
+    float* warp_maxima   = shared.warp_maxima;
+    float& result        = shared.result;
 
     const int lane = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
     const int warp = static_cast<int>(threadIdx.x) / kWarpSize;
@@ -46,7 +58,8 @@ struct TargetLogprobsColumn {
 
 template <int BlockSize>
 __device__ __forceinline__ TargetLogprobsColumn
-target_logprobs_column(const __nv_bfloat16* values, std::int32_t valid_rows) {
+target_logprobs_column(const __nv_bfloat16* values, std::int32_t valid_rows,
+                       TargetLogprobsShared<BlockSize>& shared) {
     float local_max = -CUDART_INF_F;
     float local_sum = 0.0f;
     for (std::int32_t row = static_cast<std::int32_t>(threadIdx.x); row < valid_rows;
@@ -59,12 +72,12 @@ target_logprobs_column(const __nv_bfloat16* values, std::int32_t valid_rows) {
         local_max = new_max;
         local_sum += expf(value - local_max);
     }
-    const float maximum = target_logprobs_block_max<BlockSize>(local_max);
+    const float maximum = target_logprobs_block_max<BlockSize>(local_max, shared);
 
     local_sum *= expf(local_max - maximum);
-    __shared__ float warp_sums[BlockSize / kWarpSize];
-    __shared__ float log_sum;
-    const float sum = block_reduce_sum<BlockSize>(local_sum, warp_sums);
+    float* warp_sums = shared.warp_sums;
+    float& log_sum   = shared.log_sum;
+    const float sum  = block_reduce_sum<BlockSize>(local_sum, warp_sums);
     if (threadIdx.x == 0) { log_sum = logf(sum); }
     __syncthreads();
     return {maximum, log_sum};
@@ -77,7 +90,8 @@ __launch_bounds__(BlockSize) __global__
                                 std::int32_t physical_rows, std::int32_t targets) {
     const std::int32_t column   = static_cast<std::int32_t>(blockIdx.x);
     const __nv_bfloat16* values = logits + static_cast<std::int64_t>(column) * physical_rows;
-    const TargetLogprobsColumn lse = target_logprobs_column<BlockSize>(values, valid_rows);
+    __shared__ TargetLogprobsShared<BlockSize> lse_shared;
+    const TargetLogprobsColumn lse = target_logprobs_column<BlockSize>(values, valid_rows, lse_shared);
     for (std::int32_t target = static_cast<std::int32_t>(threadIdx.x); target < targets;
          target += BlockSize) {
         const std::int64_t index = static_cast<std::int64_t>(column) * targets + target;

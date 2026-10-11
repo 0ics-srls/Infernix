@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ops/common/arch.cuh"
+
 // The wide-route grouped GEMM of offloaded_sparse_moe (wide_expert.h). It is the warp-specialized
 // TMA pipeline of the dense NVFP4 W4A4 route (ops/linear/nvfp4/nvfp4_a4_tma.cuh) made grouped and
 // persistent:
@@ -128,10 +130,14 @@ __device__ __forceinline__ void bulk_load(void* destination, const void* source,
     // The CTA-local destination form: with a shared::cluster destination ptxas guards every copy with
     // a call to a driver routine for remote CTAs, and the driver then reserves ~14 KB of stack per
     // resident thread (3.3 GiB on 170 SMs) at the kernel's first launch.
+#if INFERNIX_DEVICE_SM90
     asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
                  :
                  : "r"(smem_addr(destination)), "l"(source), "r"(bytes), "r"(smem_addr(barrier))
                  : "memory");
+#else
+    __trap();
+#endif
 }
 
 __device__ __forceinline__ std::uint32_t lds32(const std::uint8_t* p) {

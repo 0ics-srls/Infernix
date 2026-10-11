@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ops/common/arch.cuh"
+#include "ops/common/canonical_math.h"
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 
@@ -73,6 +75,19 @@ static_assert(alignof(Nvfp4QuantizedK16) == 8);
 
 __device__ __forceinline__ void
 pack_nvfp4_e2m1x16(const float2 (&values)[8], std::uint32_t& codes_lo, std::uint32_t& codes_hi) {
+#if !INFERNIX_DEVICE_SM120
+    // sm_89 has no cvt.rn.satfinite.e2m1x2.f32: the canonical encoder has its semantics (round to
+    // nearest even, saturation to 6, sign of -0 kept), low value in the low nibble.
+    std::uint32_t words[2] = {0, 0};
+#pragma unroll
+    for (int pair = 0; pair < 8; ++pair) {
+        const std::uint32_t byte = canon::e2m1_rn_satfinite(values[pair].x) |
+                                   (static_cast<std::uint32_t>(canon::e2m1_rn_satfinite(values[pair].y)) << 4);
+        words[pair / 4] |= byte << (8 * (pair & 3));
+    }
+    codes_lo = words[0];
+    codes_hi = words[1];
+#else
     asm volatile("{\n"
                  ".reg .b8 b0;\n"
                  ".reg .b8 b1;\n"
@@ -98,6 +113,7 @@ pack_nvfp4_e2m1x16(const float2 (&values)[8], std::uint32_t& codes_lo, std::uint
                    "f"(values[2].x), "f"(values[2].y), "f"(values[3].x), "f"(values[3].y),
                    "f"(values[4].x), "f"(values[4].y), "f"(values[5].x), "f"(values[5].y),
                    "f"(values[6].x), "f"(values[6].y), "f"(values[7].x), "f"(values[7].y));
+#endif
 }
 
 // Reciprocal replaces the sixteen per-value divisions with one reciprocal plus multiplies.

@@ -60,7 +60,8 @@ __launch_bounds__(BlockSize) __global__
                              std::int32_t count) {
     const std::int32_t column   = static_cast<std::int32_t>(blockIdx.x);
     const __nv_bfloat16* values = logits + static_cast<std::int64_t>(column) * physical_rows;
-    const TargetLogprobsColumn lse = target_logprobs_column<BlockSize>(values, valid_rows);
+    __shared__ TargetLogprobsShared<BlockSize> lse_shared;
+    const TargetLogprobsColumn lse = target_logprobs_column<BlockSize>(values, valid_rows, lse_shared);
 
     unsigned long long previous = ~0ULL;
     for (std::int32_t rank = 0; rank < count; ++rank) {

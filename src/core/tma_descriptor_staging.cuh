@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ops/common/arch.cuh"
+
 #include "core/device.h"
 
 #include <cuda_runtime.h>
@@ -56,7 +58,11 @@ __global__ void store_descriptor_words(const DescriptorWords<Words> source,
         destination[word] = source.words[word];
     }
     // The consumer's tensor-map acquire pairs with this release.
+#if INFERNIX_DEVICE_SM90
     asm volatile("fence.proxy.tensormap::generic.release.gpu;" : : : "memory");
+#else
+    __trap();
+#endif
 }
 
 } // namespace tma_staging_detail
@@ -65,10 +71,14 @@ __global__ void store_descriptor_words(const DescriptorWords<Words> source,
 // kernel through the generic proxy) visible to the TMA proxy. Call once per tensor map, in the
 // thread that issues cp.async.bulk.tensor with it, before its first use.
 __device__ __forceinline__ void acquire_staged_tensor_map(const void* tensor_map) {
+#if INFERNIX_DEVICE_SM90
     asm volatile("fence.proxy.tensormap::generic.acquire.gpu [%0], 128;"
                  :
                  : "l"(tensor_map)
                  : "memory");
+#else
+    __trap();
+#endif
 }
 
 template <class Descriptor>

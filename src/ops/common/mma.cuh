@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ops/common/arch.cuh"
+
 #include "ops/common/memory.cuh"
 
 namespace infernix::ops {
@@ -93,6 +95,7 @@ __device__ __forceinline__ void mma_fp8_e4m3_scaled(float& c0, float& c1, float&
                                                     unsigned sfa, unsigned sfb) {
     constexpr unsigned short kScaleBlockId  = 0;
     constexpr unsigned short kScaleThreadId = 0;
+#if INFERNIX_DEVICE_SM120
     asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X."
                  "m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, "
@@ -101,6 +104,9 @@ __device__ __forceinline__ void mma_fp8_e4m3_scaled(float& c0, float& c1, float&
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(sfa),
                    "h"(kScaleBlockId), "h"(kScaleThreadId), "r"(sfb), "h"(kScaleBlockId),
                    "h"(kScaleThreadId));
+#else
+    __trap();
+#endif
 }
 
 // On RTX 5090, block-scaled FP8 avoids the plain form's half-rate FP32 accumulation.
@@ -109,7 +115,15 @@ __device__ __forceinline__ void mma_fp8_e4m3_scaled(float& c0, float& c1, float&
 __device__ __forceinline__ void mma_fp8_e4m3(float& c0, float& c1, float& c2, float& c3,
                                              unsigned a0, unsigned a1, unsigned a2, unsigned a3,
                                              unsigned b0, unsigned b1) {
+#if INFERNIX_DEVICE_SM120
     mma_fp8_e4m3_scaled(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1, 0x7Fu, 0x7Fu);
+#else
+    // sm_89 (RTX 4090): the plain E4M3 MMA with FP32 accumulation, the same operand layout.
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
 }
 
 __device__ __forceinline__ void mma_tf32_bits(float& c0, float& c1, float& c2, float& c3,
@@ -133,6 +147,7 @@ __device__ __forceinline__ void mma_nvfp4_e4m3(float& c0, float& c1, float& c2, 
                                                unsigned sfb) {
     constexpr unsigned short kScaleBlockId  = 0;
     constexpr unsigned short kScaleThreadId = 0;
+#if INFERNIX_DEVICE_SM120
     asm volatile("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X."
                  "m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
                  "{%0,%1,%2,%3}, "
@@ -147,6 +162,9 @@ __device__ __forceinline__ void mma_nvfp4_e4m3(float& c0, float& c1, float& c2, 
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(sfa),
                    "h"(kScaleBlockId), "h"(kScaleThreadId), "r"(sfb), "h"(kScaleBlockId),
                    "h"(kScaleThreadId));
+#else
+    __trap();
+#endif
 }
 
 } // namespace infernix::ops

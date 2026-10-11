@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ops/common/arch.cuh"
+
 #include "ops/common/memory.cuh"
 
 #include <cstdint>
@@ -7,14 +9,19 @@
 namespace infernix::ops {
 
 __device__ __forceinline__ void cta_mbarrier_init(std::uint64_t* barrier, std::uint32_t arrivals) {
+#if INFERNIX_DEVICE_SM90
     asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
                  :
                  : "r"(smem_addr(barrier)), "r"(arrivals)
                  : "memory");
+#else
+    __trap();
+#endif
 }
 
 __device__ __forceinline__ void cta_mbarrier_wait(std::uint64_t* barrier, std::uint32_t phase) {
     constexpr std::uint32_t kSuspendTicks = 0x989680;
+#if INFERNIX_DEVICE_SM90
     asm volatile("{\n"
                  ".reg .pred done;\n"
                  "wait_loop_%=: \n"
@@ -26,22 +33,37 @@ __device__ __forceinline__ void cta_mbarrier_wait(std::uint64_t* barrier, std::u
                  :
                  : "r"(smem_addr(barrier)), "r"(phase), "r"(kSuspendTicks)
                  : "memory");
+#else
+    __trap();
+#endif
 }
 
 __device__ __forceinline__ void cta_mbarrier_arrive(std::uint64_t* barrier) {
+#if INFERNIX_DEVICE_SM90
     asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" : : "r"(smem_addr(barrier)) : "memory");
+#else
+    __trap();
+#endif
 }
 
 __device__ __forceinline__ void cta_mbarrier_arrive_expect_tx(std::uint64_t* barrier,
                                                               std::uint32_t bytes) {
+#if INFERNIX_DEVICE_SM90
     asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;"
                  :
                  : "r"(smem_addr(barrier)), "r"(bytes)
                  : "memory");
+#else
+    __trap();
+#endif
 }
 
 __device__ __forceinline__ void cta_mbarrier_fence_init() {
+#if INFERNIX_DEVICE_SM90
     asm volatile("fence.mbarrier_init.release.cluster;" : : : "memory");
+#else
+    __trap();
+#endif
 }
 
 } // namespace infernix::ops
