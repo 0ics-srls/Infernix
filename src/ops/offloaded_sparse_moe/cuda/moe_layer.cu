@@ -1778,7 +1778,10 @@ __global__ void __launch_bounds__(kThreads)
 
 // ------------------------------------------------------------------ A4(x) plane (act_plane)
 
-// One CTA per job: every entry of the job's expert, quantized with its gate/up input scale, at its
+constexpr int kActPlaneSplit = 10; // CTAs per job (16 blocks each)
+static_assert(moe::kGateUpBlocks % kActPlaneSplit == 0);
+
+// kActPlaneSplit CTAs per job: every entry of the job's expert, quantized with its gate/up input scale, at its
 // dispatch position. Jobs this GPU does not compute (flagged, not resident and not staged) are
 // skipped like the passes skip them; experts with split input scales quantize in the kernel.
 __global__ void __launch_bounds__(kThreads)
@@ -1790,8 +1793,11 @@ __global__ void __launch_bounds__(kThreads)
     const moe::ExpertScales scales = source.scales[expert];
     if (scales.input_up != scales.input_gate) { return; }
     const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
-    for (int i = threadIdx.x; i < count * moe::kGateUpBlocks; i += blockDim.x) {
-        const int c = i / moe::kGateUpBlocks, b = i % moe::kGateUpBlocks;
+    // CTA y of kActPlaneSplit takes blocks [y * kSpan, (y + 1) * kSpan) of every entry of the job.
+    constexpr int kSpan = moe::kGateUpBlocks / kActPlaneSplit;
+    const int b0 = static_cast<int>(blockIdx.y) * kSpan;
+    for (int i = threadIdx.x; i < count * kSpan; i += blockDim.x) {
+        const int c = i / kSpan, b = b0 + i % kSpan;
         const int t = dispatch.entries[first + c] / top_k;
         const auto* v = reinterpret_cast<const std::uint16_t*>(x + static_cast<std::size_t>(t) * hidden + 16 * b);
         plane[static_cast<std::size_t>(first + c) * moe::kGateUpBlocks + b] =
@@ -2217,7 +2223,7 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     }
     if (use_wide) { wide = moe::wide::prepare(x, dispatch, source, top_k, max_jobs, pass_jobs, layout, outputs, stream); }
     if (source.act_plane != nullptr && source.activation == moe::ExpertActivation::kA4) {
-        act_plane_kernel<<<max_jobs, kThreads, 0, stream>>>(static_cast<const bf16*>(x.data), moe::kHidden, dispatch,
+        act_plane_kernel<<<dim3(max_jobs, kActPlaneSplit), kThreads, 0, stream>>>(static_cast<const bf16*>(x.data), moe::kHidden, dispatch,
                                                              source, top_k, flags, static_cast<ActBlock*>(source.act_plane));
         check_launch("act plane");
     }

@@ -352,7 +352,8 @@ void RemoteExpertService::serve() {
                     moe_experts(x, dispatch, source, top_k, jobs, workspace_, outputs, stream, true);
                     require_cuda(cudaEventRecord(marks[2], stream), "event");
                     const int vectors = kHidden * 2 / 16;
-                    const int blocks  = std::min(1024, (entries * vectors + 255) / 256);
+                    // About one 16-byte vector per thread: the mapped writes of many CTAs are in flight together.
+                    const int blocks  = std::min(2048, (entries * vectors + 255) / 256);
                     gather_kernel<<<blocks, 256, 0, stream>>>(reinterpret_cast<const int4*>(outputs_),
                                                              dispatch_ + list, entries, vectors,
                                                              reinterpret_cast<int4*>(y_));
