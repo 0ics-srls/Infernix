@@ -13,6 +13,7 @@
 #include "infernix/ops/offloaded_sparse_moe.h"
 
 #include "core/device.h"
+#include "core/device_arch.h"
 #include "core/pdl.cuh"
 
 #include "ops/common/canonical_math.h"
@@ -24,6 +25,7 @@
 #include <array>
 #include <atomic>
 #include <cstddef>
+#include <cstdlib>
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -1930,6 +1932,19 @@ bool fetch_served(const MoeExpertSource& source) { return source.fetch.request !
 
 bool remote_served(const MoeExpertSource& source) { return source.remote.held != nullptr; }
 
+// The one-column kernels widen E2M1 to FP16 with one instruction from sm_100 on; below it (the V100
+// and RTX 4090 of this fork) the widening is arithmetic, and on the V100 they measured latency-bound
+// (ncu: gate/up 54-80 us per CTA at 12 % occupancy), so devices below sm_80 take the eight-column
+// kernels (dp4a over byte-permuted codes) for every width. INFERNIX_ONE_COLUMN_KERNELS=0/1 forces it.
+bool one_column_kernels() {
+    static const int forced = [] {
+        const char* v = std::getenv("INFERNIX_ONE_COLUMN_KERNELS");
+        return v == nullptr || *v == '\0' ? -1 : (*v == '0' ? 0 : 1);
+    }();
+    if (forced >= 0) { return forced == 1; }
+    return current_device_compute_major() >= 8;
+}
+
 } // namespace
 
 void moe_experts_cpu_wait(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source,
@@ -2068,7 +2083,7 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         check_launch("stage");
         const auto* xs = static_cast<const bf16*>(x.data);
         auto* out      = static_cast<bf16*>(outputs.data);
-        const bool few = x.ne[1] <= kNarrowPassColumns;
+        const bool few = x.ne[1] <= kNarrowPassColumns && one_column_kernels();
         launch_pass(few, xs, dispatch, source, top_k, job_records, flags, 0, max_jobs, layout, outputs.ne[1], out,
                     source.fork_stream, PassPhase::Staged);
         launch_pass(few, xs, dispatch, source, top_k, job_records, flags, 0, max_jobs, layout, outputs.ne[1], out, stream,
@@ -2091,7 +2106,7 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         // Calls of a few columns (decode, MTP verification) use the one-column kernels, which fit
         // two gate/up CTAs per SM; a job with several columns takes one pass per column over its
         // staged weights.
-        launch_pass(x.ne[1] <= kNarrowPassColumns, static_cast<const bf16*>(x.data), dispatch, source, top_k,
+        launch_pass(x.ne[1] <= kNarrowPassColumns && one_column_kernels(), static_cast<const bf16*>(x.data), dispatch, source, top_k,
                     job_records, flags, base, jobs, layout, outputs.ne[1], static_cast<bf16*>(outputs.data), stream);
         if (wide) { moe::wide::run_pass(*wide, base / pass_jobs, stream); }
     }
