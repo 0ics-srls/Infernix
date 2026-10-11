@@ -92,6 +92,7 @@ private:
     std::uint16_t* outputs_      = nullptr; // BF16 [H, kMaxRemoteEntries]
     std::int32_t* dispatch_      = nullptr; // counts, offsets, cursor, entries, jobs, job_count, entry list
     void* workspace_             = nullptr;
+    void* act_plane_             = nullptr; // A4(x) of every entry, once per call (MoeExpertSource::act_plane)
     std::size_t dispatch_ints_   = 0;
     // Main GPU memory.
     std::int32_t* held_tables_   = nullptr; // [layers][experts]

@@ -939,6 +939,10 @@ __global__ void __launch_bounds__(kThreads, Columns == 1 ? 2 : 1)
             if constexpr (Columns == 1) {
                 quantize_column_codes(x, hidden, dispatch.entries, first + pass, top_k, input_scale, sm.acts,
                                       moe::kGateUpBlocks);
+            } else if (source.act_plane != nullptr && !split_input) {
+                const auto* plane = static_cast<const ActBlock*>(source.act_plane) +
+                                    static_cast<std::size_t>(first + pass) * moe::kGateUpBlocks;
+                for (int i = threadIdx.x; i < n * moe::kGateUpBlocks; i += blockDim.x) { sm.acts[i] = plane[i]; }
             } else {
                 quantize_columns(x, hidden, dispatch.entries, first + pass, n, top_k, input_scale, sm.acts,
                                  moe::kGateUpBlocks);
@@ -1743,6 +1747,29 @@ __global__ void __launch_bounds__(kThreads)
     }
 }
 
+// ------------------------------------------------------------------ A4(x) plane (act_plane)
+
+// One CTA per job: every entry of the job's expert, quantized with its gate/up input scale, at its
+// dispatch position. Jobs this GPU does not compute (flagged, not resident and not staged) are
+// skipped like the passes skip them; experts with split input scales quantize in the kernel.
+__global__ void __launch_bounds__(kThreads)
+    act_plane_kernel(const bf16* __restrict__ x, int hidden, MoeDispatch dispatch, MoeExpertSource source, int top_k,
+                     const std::int32_t* __restrict__ cpu_flags, ActBlock* __restrict__ plane) {
+    const int job = static_cast<int>(blockIdx.x);
+    if (job >= *dispatch.job_count || (cpu_flags != nullptr && cpu_flags[job] != 0)) { return; }
+    const int expert               = dispatch.jobs[job];
+    const moe::ExpertScales scales = source.scales[expert];
+    if (scales.input_up != scales.input_gate) { return; }
+    const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
+    for (int i = threadIdx.x; i < count * moe::kGateUpBlocks; i += blockDim.x) {
+        const int c = i / moe::kGateUpBlocks, b = i % moe::kGateUpBlocks;
+        const int t = dispatch.entries[first + c] / top_k;
+        const auto* v = reinterpret_cast<const std::uint16_t*>(x + static_cast<std::size_t>(t) * hidden + 16 * b);
+        plane[static_cast<std::size_t>(first + c) * moe::kGateUpBlocks + b] =
+            to_act(canon::quantize_a4_block(v, scales.input_gate));
+    }
+}
+
 // ---------------------------------------------------------------- remote experts (a second GPU)
 
 // One CTA: every non-resident, non-streamed expert the remote GPU holds becomes a remote job,
@@ -1949,6 +1976,10 @@ void moe_dispatch(const MoeRouting& routing, std::int32_t experts, MoeDispatch& 
     check_launch("scatter");
 }
 
+std::size_t moe_act_plane_bytes(std::int32_t entries) {
+    return static_cast<std::size_t>(entries) * moe::kGateUpBlocks * sizeof(ActBlock);
+}
+
 std::size_t moe_experts_workspace_bytes(std::int32_t max_jobs, std::int32_t entries, std::int32_t columns,
                                         moe::ExpertActivation activation) {
     return moe::wide::experts_workspace_bytes(max_jobs, entries, columns, activation);
@@ -2146,6 +2177,11 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         return;
     }
     if (use_wide) { wide = moe::wide::prepare(x, dispatch, source, top_k, max_jobs, pass_jobs, layout, outputs, stream); }
+    if (source.act_plane != nullptr && source.activation == moe::ExpertActivation::kA4) {
+        act_plane_kernel<<<max_jobs, kThreads, 0, stream>>>(static_cast<const bf16*>(x.data), moe::kHidden, dispatch,
+                                                             source, top_k, flags, static_cast<ActBlock*>(source.act_plane));
+        check_launch("act plane");
+    }
     MoeExpertSource unlanded = source; // landing is for forked calls only
     unlanded.landing         = nullptr;
     unlanded.landing_slots   = 0;

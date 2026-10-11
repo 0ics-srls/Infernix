@@ -109,6 +109,7 @@ RemoteExpertService::RemoteExpertService(Options options) : options_(std::move(o
                                                                   kMaxRemoteEntries, kMaxRemoteColumns,
                                                                   options_.activation);
         require_cuda(cudaMalloc(&workspace_, workspace), "cudaMalloc workspace");
+        require_cuda(cudaMalloc(&act_plane_, moe_act_plane_bytes(kMaxRemoteEntries)), "cudaMalloc act plane");
         std::size_t free = 0, total = 0;
         require_cuda(cudaMemGetInfo(&free, &total), "cudaMemGetInfo");
         const std::uint64_t usable = free > options_.reserve_bytes ? free - options_.reserve_bytes : 0;
@@ -163,6 +164,7 @@ RemoteExpertService::~RemoteExpertService() {
         }
         if (cudaSetDevice(options_.device) == cudaSuccess) {
             cudaFree(records_);
+            cudaFree(act_plane_);
             cudaFree(workspace_);
             cudaFree(dispatch_);
             cudaFree(outputs_);
@@ -343,6 +345,7 @@ void RemoteExpertService::serve() {
                     source.record_stride = options_.record_stride;
                     source.scales        = scales_ + static_cast<std::size_t>(layer) * E;
                     source.activation    = options_.activation;
+                    source.act_plane     = act_plane_;
                     const Tensor x(x_device_, DType::BF16, {kHidden, columns});
                     Tensor outputs(outputs_, DType::BF16, {kHidden, columns * top_k});
                     require_cuda(cudaEventRecord(marks[1], stream), "event");

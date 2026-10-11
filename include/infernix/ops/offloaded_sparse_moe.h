@@ -187,6 +187,11 @@ struct MoeExpertSource {
     MoeCpuChannel cpu;
     MoeFetchChannel fetch; // with host_table only; needs staging_slots > 0 and max_jobs <= kMaxFetch
     MoeRemoteChannel remote; // experts held by a second GPU (held == nullptr: none)
+    // Optional device scratch for the multi-column narrow kernels (the V100's expert service): the
+    // call quantizes every routed entry's x column with its expert's gate/up input scale once, into
+    // moe_act_plane_bytes(entries) bytes here, and the gate/up CTAs read it instead of each
+    // quantizing the column again. Same A4 blocks, so no bit changes. Null: each CTA quantizes.
+    void* act_plane = nullptr;
     // Optional overlap of staging with compute for calls of several passes (prefill chunks): the
     // slots are split in two halves and pass p+1 is staged on `overlap_stream` while pass p
     // computes. The stream and the five events (start, staged[2], consumed[2]) are caller-owned;
@@ -220,6 +225,9 @@ struct MoeExpertSource {
     const std::int32_t* prefetched     = nullptr;
     const std::uint8_t* prefetch_base  = nullptr;
 };
+
+/// Bytes of MoeExpertSource::act_plane for `entries` routed entries.
+[[nodiscard]] std::size_t moe_act_plane_bytes(std::int32_t entries);
 
 /// Workspace of one moe_experts call of `columns` (T) columns and `entries` (k*T) routed entries
 /// with the layer's expert arithmetic.
