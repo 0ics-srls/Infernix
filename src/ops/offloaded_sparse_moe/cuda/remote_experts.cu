@@ -263,7 +263,7 @@ void RemoteExpertService::serve() {
         auto* volatile_status      = reinterpret_cast<volatile std::uint32_t*>(done_ + 1);
         auto* volatile_beat        = reinterpret_cast<volatile std::uint32_t*>(done_ + 2);
         std::uint32_t beat         = 0;
-        std::uint32_t seen         = *volatile_sequence;
+        std::uint32_t seen         = 0; // sequences are never 0: a request written before this thread starts is still new
         auto last                  = std::chrono::steady_clock::now();
         std::uint32_t polls        = 0;
         std::vector<int> order;
