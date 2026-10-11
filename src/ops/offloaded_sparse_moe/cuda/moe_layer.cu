@@ -2020,28 +2020,46 @@ struct WmmaShared {
     };
 };
 
-// The tile's FP32 sums over K: rows [64 * row_tile, +64) of a matrix of `blocks` K blocks starting at
-// `offset` in the record, against `columns(c, k)` for the tile's columns.
+// One step's weights into sm.step.a: the 8 units of 4 row groups x 2 K blocks, one 32-bit code word
+// (rows i and i + 8 of a unit at k = 4q .. 4q + 3) per thread. In the record layout word w of a unit
+// is q = w / 8, i = w % 8; in the row-pair layout q = w % 4, i = w / 4.
+template <int Blocks>
+__device__ __forceinline__ void wmma_widen_weights(WmmaShared& sm, const std::uint8_t* matrix, int row_tile, int b0,
+                                                   bool row_pairs) {
+    const int t = static_cast<int>(threadIdx.x);
+    const int u = t / 32, w = t % 32;                 // unit of the step, its code word
+    const int group = u / 2, kb = u % 2;              // row group in the tile, K block in the step
+    const int q = row_pairs ? w % 4 : w / 8, i = row_pairs ? w / 4 : w % 8;
+    const std::uint8_t* unit =
+        matrix + (static_cast<std::size_t>(4 * row_tile + group) * Blocks + b0 + kb) * moe::kUnitBytes;
+    const std::uint32_t word = __ldg(reinterpret_cast<const std::uint32_t*>(unit) + w);
+    const float s_lo = canon::e4m3_value(__ldg(unit + 128 + i)), s_hi = canon::e4m3_value(__ldg(unit + 128 + 8 + i));
+    __half* lo = &sm.step.a[16 * group + i][16 * kb + 4 * q];
+    __half* hi = &sm.step.a[16 * group + 8 + i][16 * kb + 4 * q];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const unsigned byte = (word >> (8 * j)) & 255U;
+        lo[j] = __float2half_rn(e2m1_float(byte & 15U) * s_lo);
+        hi[j] = __float2half_rn(e2m1_float(byte >> 4) * s_hi);
+    }
+}
+
+// The tile's FP32 sums over K for rows [64 * row_tile, +64) of a matrix of `Blocks` K blocks; Columns
+// writes the step's column values (sm.step.b) for K blocks b0, b0 + 1.
 template <int Blocks, class Columns>
-__device__ void wmma_tile(WmmaShared& sm, const std::uint8_t* matrix, int row_tile, bool row_pairs, Columns columns) {
+__device__ void wmma_tile(WmmaShared& sm, const std::uint8_t* matrix, int row_tile, bool row_pairs, int n,
+                          Columns columns) {
     using namespace nvcuda;
+    static_assert(kThreads == 256 && kWmmaK == 32, "one code word and eight column values per thread");
     const int warp = threadIdx.x / 32;
     const int wr = warp / 2, wc = (warp % 2) * 2; // a 16-row slab, two 16-column slabs
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2];
     wmma::fill_fragment(acc[0], 0.0F);
     wmma::fill_fragment(acc[1], 0.0F);
-    for (int b0 = 0; b0 < Blocks; b0 += kWmmaK / 16) {
-        for (int e = threadIdx.x; e < kWmmaRows * kWmmaK; e += blockDim.x) {
-            const int row = e / kWmmaK, kk = e % kWmmaK, b = b0 + kk / 16, k = kk % 16;
-            const std::uint8_t* unit =
-                matrix + (static_cast<std::size_t>(4 * row_tile + row / 16) * Blocks + b) * moe::kUnitBytes;
-            const float w = e2m1_float(unit_code(unit, row % 16, k, row_pairs)) * canon::e4m3_value(unit[128 + row % 16]);
-            sm.step.a[row][kk] = __float2half_rn(w);
-        }
-        for (int e = threadIdx.x; e < kWmmaCols * kWmmaK; e += blockDim.x) {
-            const int c = e / kWmmaK, kk = e % kWmmaK;
-            sm.step.b[c][kk] = __float2half_rn(columns(c, b0 * 16 + kk));
-        }
+    const int slabs = (n + 15) / 16; // column slabs holding columns
+    for (int b0 = 0; b0 < Blocks; b0 += 2) {
+        wmma_widen_weights<Blocks>(sm, matrix, row_tile, b0, row_pairs);
+        columns(b0);
         __syncthreads();
         wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
         wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
@@ -2050,8 +2068,10 @@ __device__ void wmma_tile(WmmaShared& sm, const std::uint8_t* matrix, int row_ti
             wmma::load_matrix_sync(fa, &sm.step.a[16 * wr][ks], kWmmaLd);
 #pragma unroll
             for (int t = 0; t < 2; ++t) {
-                wmma::load_matrix_sync(fb, &sm.step.b[16 * (wc + t)][ks], kWmmaLd);
-                wmma::mma_sync(acc[t], fa, fb, acc[t]);
+                if (wc + t < slabs) { // warp-uniform
+                    wmma::load_matrix_sync(fb, &sm.step.b[16 * (wc + t)][ks], kWmmaLd);
+                    wmma::mma_sync(acc[t], fa, fb, acc[t]);
+                }
             }
         }
         __syncthreads();
@@ -2079,13 +2099,24 @@ __global__ void __launch_bounds__(kThreads)
     const moe::ExpertScales scales = source.scales[expert];
     const std::uint8_t* record     = wmma_record(source, expert, job_records, job);
     const int row_tile             = static_cast<int>(blockIdx.x);
-    const auto columns = [&](int c, int k) -> float {
-        if (c >= n) { return 0.0F; }
+    // Thread t: column t / 4, eight values from k = 8 (t % 4) of the step (four codes bytes, one scale).
+    const auto columns = [&](int b0) {
+        const int t = static_cast<int>(threadIdx.x);
+        const int c = t / 4, part = t % 4, kb = part / 2, k0 = (part % 2) * 8;
+        __half* out = &sm.step.b[c][16 * kb + k0];
+        if (c >= n) {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) { out[j] = __float2half_rn(0.0F); }
+            return;
+        }
         const std::uint8_t* row = x_plane + static_cast<std::size_t>(first + c0 + c) * moe::wide::kXRowBytes;
-        const unsigned code     = (row[k / 2] >> ((k & 1) * 4)) & 15U;
-        return e2m1_float(code) * canon::e4m3_value(row[moe::wide::kXCodeBytes + k / 16]);
+        const int b            = b0 + kb;
+        const std::uint32_t codes = *reinterpret_cast<const std::uint32_t*>(row + 8 * b + k0 / 2);
+        const float scale         = canon::e4m3_value(row[moe::wide::kXCodeBytes + b]);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { out[j] = __float2half_rn(e2m1_float((codes >> (4 * j)) & 15U) * scale); }
     };
-    wmma_tile<moe::kGateUpBlocks>(sm, record, row_tile, source.row_pair_units, columns);
+    wmma_tile<moe::kGateUpBlocks>(sm, record, row_tile, source.row_pair_units, n, columns);
     for (int i = threadIdx.x; i < 2 * n; i += blockDim.x) {
         const int s = i / n, c = i % n;
         std::uint16_t h[16];
@@ -2116,12 +2147,21 @@ __global__ void __launch_bounds__(kThreads)
     const moe::ExpertScales scales = source.scales[expert];
     const std::uint8_t* record     = wmma_record(source, expert, job_records, job);
     const int row_tile             = static_cast<int>(blockIdx.x);
-    const auto columns = [&](int c, int k) -> float {
-        if (c >= n) { return 0.0F; }
-        const canon::A4Block& hb = h_blocks[static_cast<std::size_t>(first + c0 + c) * kHBlocks + k / 16];
-        return 0.5F * static_cast<float>(hb.c2[k % 16]) * (static_cast<float>(hb.scale_scaled) * (1.0F / 512.0F));
+    const auto columns = [&](int b0) {
+        const int t = static_cast<int>(threadIdx.x);
+        const int c = t / 4, part = t % 4, kb = part / 2, k0 = (part % 2) * 8;
+        __half* out = &sm.step.b[c][16 * kb + k0];
+        if (c >= n) {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) { out[j] = __float2half_rn(0.0F); }
+            return;
+        }
+        const canon::A4Block& hb = h_blocks[static_cast<std::size_t>(first + c0 + c) * kHBlocks + b0 + kb];
+        const float scale        = 0.5F * static_cast<float>(hb.scale_scaled) * (1.0F / 512.0F);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { out[j] = __float2half_rn(static_cast<float>(hb.c2[k0 + j]) * scale); }
     };
-    wmma_tile<moe::kDownBlocks>(sm, record + moe::kGateUpBytes, row_tile, source.row_pair_units, columns);
+    wmma_tile<moe::kDownBlocks>(sm, record + moe::kGateUpBytes, row_tile, source.row_pair_units, n, columns);
     for (int i = threadIdx.x; i < kWmmaRows * n; i += blockDim.x) {
         const int row = i % kWmmaRows, c = i / kWmmaRows;
         const int column = dispatch.entries[first + c0 + c];
