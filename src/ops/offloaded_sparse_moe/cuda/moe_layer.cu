@@ -688,23 +688,42 @@ __device__ void unit_sums(const std::uint8_t* matrix, int blocks, int rg0, const
 #pragma unroll
         for (int c = 0; c < Columns; ++c) { s[g][c] = 0; }
     }
-    for (int u = warp; u < Groups * blocks; u += kWarps) {
-        const int g = u / blocks, b = u % blocks;
-        const std::uint8_t* unit = matrix + (static_cast<std::size_t>(rg0 + g) * blocks + b) * moe::kUnitBytes;
-        const int w0 = row_quad(unit, r, 2 * half);
-        const int w1 = row_quad(unit, r, 2 * half + 1);
-        const int sw = canon::e4m3_scaled(unit[128 + r]);
+    // The units of kAhead iterations are loaded before any of them is used, so a warp keeps their
+    // weight reads in flight together (on the V100 the slice is read from global memory, and one
+    // unit waited for at a time made the loop latency-bound). Integer sums: the order changes no bit.
+    constexpr int kAhead = 4;
+    const int units      = Groups * blocks;
+    for (int u0 = warp; u0 < units; u0 += kAhead * kWarps) {
+        int w0[kAhead], w1[kAhead], sw[kAhead];
 #pragma unroll
-        for (int c = 0; c < Columns; ++c) {
-            if (c < n) { // n is uniform across the warp, so the shuffle below is converged
-                const ActBlock& a = acts[c * blocks + b];
-                int p             = __dp4a(w0, a.quads[2 * half], 0);
-                p                 = __dp4a(w1, a.quads[2 * half + 1], p);
-                p += __shfl_xor_sync(0xFFFFFFFFU, p, 16);
-                // |P| <= 2304 and Sw < 2^18: P * Sw fits int32 (design §16.2).
+        for (int k = 0; k < kAhead; ++k) {
+            const int u = u0 + k * kWarps;
+            w0[k] = w1[k] = sw[k] = 0;
+            if (u < units) {
+                const int g = u / blocks, b = u % blocks;
+                const std::uint8_t* unit = matrix + (static_cast<std::size_t>(rg0 + g) * blocks + b) * moe::kUnitBytes;
+                w0[k] = row_quad(unit, r, 2 * half);
+                w1[k] = row_quad(unit, r, 2 * half + 1);
+                sw[k] = canon::e4m3_scaled(unit[128 + r]);
+            }
+        }
 #pragma unroll
-                for (int gg = 0; gg < Groups; ++gg) {
-                    if (gg == g) { s[gg][c] += static_cast<std::int64_t>(p * sw) * a.scale; }
+        for (int k = 0; k < kAhead; ++k) {
+            const int u = u0 + k * kWarps;
+            if (u >= units) { continue; } // uniform across the warp
+            const int g = u / blocks, b = u % blocks;
+#pragma unroll
+            for (int c = 0; c < Columns; ++c) {
+                if (c < n) { // n is uniform across the warp, so the shuffle below is converged
+                    const ActBlock& a = acts[c * blocks + b];
+                    int p             = __dp4a(w0[k], a.quads[2 * half], 0);
+                    p                 = __dp4a(w1[k], a.quads[2 * half + 1], p);
+                    p += __shfl_xor_sync(0xFFFFFFFFU, p, 16);
+                    // |P| <= 2304 and Sw < 2^18: P * Sw fits int32 (design §16.2).
+#pragma unroll
+                    for (int gg = 0; gg < Groups; ++gg) {
+                        if (gg == g) { s[gg][c] += static_cast<std::int64_t>(p * sw[k]) * a.scale; }
+                    }
                 }
             }
         }
