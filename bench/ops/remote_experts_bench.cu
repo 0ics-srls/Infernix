@@ -38,14 +38,18 @@ int main(int argc, char** argv) {
     o.experts = kExperts;
     o.record_stride = stride;
     o.scales = {scales.data(), scales.data()};
-    o.max_records = 1024;
+    o.max_records = 64;
     RemoteExpertService service(o);
 
     std::mt19937 rng(7);
     std::vector<std::uint32_t> keys;
     for (std::uint32_t k = 0; k < std::min<std::uint32_t>(service.capacity(), kLayers * kExperts); ++k) { keys.push_back(k); }
     service.load(keys, [&](std::uint32_t, std::uint8_t* d) {
-        for (std::uint64_t i = 0; i < stride; ++i) { d[i] = static_cast<std::uint8_t>(rng()); }
+        std::uint64_t z = rng();
+        for (std::uint64_t i = 0; i + 8 <= stride; i += 8) {
+            z = z * 6364136223846793005ULL + 1442695040888963407ULL;
+            std::memcpy(d + i, &z, 8);
+        }
         // E4M3 block scales of 1.0 (0x38) in every unit's scale bytes: bytes 128..143 of each 144-byte unit.
         for (std::uint64_t u = 0; u + 144 <= stride; u += 144) {
             for (int b = 128; b < 144; ++b) { d[u + b] = 0x38; }
@@ -66,14 +70,14 @@ int main(int argc, char** argv) {
     for (int q = 0; q < requests; ++q) {
         int at = 0;
         for (int j = 0; j < jobs; ++j) {
-            r->expert[j] = (j * 37 + q * 11) % kExperts;
+            r->expert[j] = (j * 9 + q) % 64;
             const int n  = 1 + (j % per_job);
             r->first[j]  = at;
             r->count[j]  = n;
             for (int c = 0; c < n; ++c) { r->entry[at++] = ((c + j) % columns) * kTopK + (j % kTopK); }
         }
         // distinct experts per request
-        for (int j = 0; j < jobs; ++j) { r->expert[j] = (r->expert[j] + j) % kExperts; }
+        
         r->layer = 0;
         r->columns = columns;
         r->top_k = kTopK;
