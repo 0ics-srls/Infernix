@@ -39,6 +39,7 @@ std::unique_ptr<RemoteExpertService> make_service(bool row_pairs, const std::vec
     o.scales = {scales.data(), scales.data()};
     o.max_records = kHeld;
     o.row_pair_units = row_pairs;
+    o.fast_call      = row_pairs; // the reference: record layout and moe_experts' record path
     auto service = std::make_unique<RemoteExpertService>(o);
     std::vector<std::uint32_t> keys;
     for (std::uint32_t k = 0; k < kHeld; ++k) { keys.push_back(k); }
@@ -119,7 +120,7 @@ int main(int argc, char** argv) {
                 if (a.y[i] != b.y[i]) { ++differ; }
             }
         }
-        std::printf("check: %lld of %lld outputs differ between the record and row-pair layouts; failures: '%s' '%s'\n",
+        std::printf("check: %lld of %lld outputs differ between the record path and the fast row-pair path; failures: '%s' '%s'\n",
                     differ, total, plain->failure().c_str(), pairs->failure().c_str());
     }
     auto service = make_service(true, scales);
