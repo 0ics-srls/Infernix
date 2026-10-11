@@ -918,7 +918,7 @@ struct GateUpDirect {
 };
 
 template <int Columns>
-__global__ void __launch_bounds__(kThreads, Columns == 1 ? 2 : 1)
+__global__ void __launch_bounds__(kThreads, Columns == 1 ? 2 : (Columns <= 5 ? 4 : 1))
     gate_up_kernel(const bf16* __restrict__ x, int hidden, MoeDispatch dispatch,
                    MoeExpertSource source, int top_k, const std::uint8_t* const* __restrict__ job_records,
                    const std::int32_t* __restrict__ cpu_flags, int job_base, canon::A4Block* __restrict__ h_blocks,
@@ -1035,7 +1035,7 @@ int down_shared_bytes() {
 }
 
 template <int Columns>
-__global__ void __launch_bounds__(kThreads)
+__global__ void __launch_bounds__(kThreads, Columns <= 5 && Columns > 1 ? 4 : 1)
     down_kernel(MoeDispatch dispatch, MoeExpertSource source, int hidden,
                 const std::uint8_t* const* __restrict__ job_records, const std::int32_t* __restrict__ cpu_flags,
                 int job_base, const canon::A4Block* __restrict__ h_blocks, int columns_out,
