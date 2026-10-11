@@ -156,7 +156,7 @@ namespace {
 // Byte offsets of the workspace's regions; `end` is its size.
 struct Offsets {
     std::size_t job_records, cpu_flags, cpu_call, tiles, pass_tiles;
-    std::size_t h_blocks, x_plane;                      // W4A4
+    std::size_t h_blocks, x_plane, wide_x, wide_h;      // W4A4
     std::size_t x_limbs, h_rows, x_emax, h_emax;        // W4A16
     std::size_t end;
 };
@@ -187,6 +187,10 @@ Offsets offsets(std::int32_t max_jobs, std::int32_t entries, std::int32_t column
     } else {
         o.h_blocks = take(e * kHBlocks * sizeof(canon::A4Block));
         o.x_plane  = take(e * kXRowBytes);
+        if (!wide_route_available()) { // the WMMA wide route's FP16 planes (moe_layer.cu)
+            o.wide_x = take((e + 64) * kHidden * sizeof(std::uint16_t));
+            o.wide_h = take((e + 64) * kIntermediate * sizeof(std::uint16_t));
+        }
     }
     o.end = p;
     return o;
@@ -321,6 +325,10 @@ ExpertsWorkspace carve_experts_workspace(void* base, std::int32_t max_jobs, std:
     } else {
         w.h_blocks = reinterpret_cast<canon::A4Block*>(p + o.h_blocks);
         w.x_plane  = reinterpret_cast<std::uint8_t*>(p + o.x_plane);
+    if (o.wide_x != 0) {
+        w.wide_x = reinterpret_cast<std::uint16_t*>(p + o.wide_x);
+        w.wide_h = reinterpret_cast<std::uint16_t*>(p + o.wide_h);
+    }
     }
     return w;
 }

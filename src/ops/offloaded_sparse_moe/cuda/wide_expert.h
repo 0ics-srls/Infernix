@@ -114,6 +114,10 @@ struct ExpertsWorkspace {
     std::uint8_t* h_rows;         // [entries][kA16HRowBytes]: BF16 h, rewritten as limbs for wide entries
     std::int32_t* x_emax;         // [columns]: column exponent of each token's x
     std::int32_t* h_emax;         // [entries]: column exponent of each wide entry's h
+    // Below sm_120 (the WMMA wide route, W4A4): FP16 values of every entry's A4(x) and A4(h), plus 64
+    // entries of padding (a tile's last column slab may read past the call's entries).
+    std::uint16_t* wide_x;        // [entries + 64][kHidden]
+    std::uint16_t* wide_h;        // [entries + 64][kIntermediate]
 };
 
 // Bytes of a call's CPU bookkeeping (moe_layer.cu's CpuCall: two words and kMaxCpuJobs job indices).
