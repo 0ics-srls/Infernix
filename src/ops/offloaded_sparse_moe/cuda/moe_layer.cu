@@ -21,6 +21,8 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+#include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -1033,18 +1035,21 @@ void launch_expert_pass(const bf16* x, const MoeDispatch& dispatch, const MoeExp
                         const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
                         canon::A4Block* h_blocks, int columns_out, bf16* outputs, cudaStream_t stream,
                         PassPhase phase = PassPhase::All) {
-    static const bool configured = [] {
-        cudaFuncSetAttribute(gate_up_kernel<Columns>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             static_cast<int>(sizeof(GateUpShared<Columns>)));
-        cudaFuncSetAttribute(down_kernel<Columns>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             static_cast<int>(sizeof(DownShared<Columns>)));
-        cudaFuncSetAttribute(gate_up_kernel<Columns>, cudaFuncAttributePreferredSharedMemoryCarveout,
-                             cudaSharedmemCarveoutMaxShared);
-        cudaFuncSetAttribute(down_kernel<Columns>, cudaFuncAttributePreferredSharedMemoryCarveout,
-                             cudaSharedmemCarveoutMaxShared);
-        return true;
-    }();
-    (void)configured;
+    // Per device: the V100's expert service runs these kernels beside the RTX 4090 (the attributes
+    // are a function's per-device state, so a process-wide once would leave the second GPU unset).
+    static std::array<std::atomic<bool>, 16> configured{};
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    if (device >= 0 && device < 16 && !configured[static_cast<std::size_t>(device)].exchange(true)) {
+            cudaFuncSetAttribute(gate_up_kernel<Columns>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                         static_cast<int>(sizeof(GateUpShared<Columns>)));
+            cudaFuncSetAttribute(down_kernel<Columns>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                         static_cast<int>(sizeof(DownShared<Columns>)));
+            cudaFuncSetAttribute(gate_up_kernel<Columns>, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                         cudaSharedmemCarveoutMaxShared);
+            cudaFuncSetAttribute(down_kernel<Columns>, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                         cudaSharedmemCarveoutMaxShared);
+    }
     gate_up_kernel<Columns><<<dim3(kGateUpCtas, jobs), kThreads, sizeof(GateUpShared<Columns>), stream>>>(
         x, moe::kHidden, dispatch, source, top_k, job_records, flags, base, h_blocks, phase);
     check_launch("gate/up");
@@ -1322,18 +1327,21 @@ void launch_expert_pass_a16(const bf16* x, const MoeDispatch& dispatch, const Mo
                             const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
                             std::uint16_t* h_plane, bf16* outputs, cudaStream_t stream,
                             PassPhase phase = PassPhase::All) {
-    static const bool configured = [] {
-        cudaFuncSetAttribute(gate_up_kernel_a16<Columns>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             static_cast<int>(sizeof(GateUpShared16<Columns>)));
-        cudaFuncSetAttribute(down_kernel_a16<Columns>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             static_cast<int>(sizeof(DownShared16<Columns>)));
-        cudaFuncSetAttribute(gate_up_kernel_a16<Columns>, cudaFuncAttributePreferredSharedMemoryCarveout,
-                             cudaSharedmemCarveoutMaxShared);
-        cudaFuncSetAttribute(down_kernel_a16<Columns>, cudaFuncAttributePreferredSharedMemoryCarveout,
-                             cudaSharedmemCarveoutMaxShared);
-        return true;
-    }();
-    (void)configured;
+    // Per device: the V100's expert service runs these kernels beside the RTX 4090 (the attributes
+    // are a function's per-device state, so a process-wide once would leave the second GPU unset).
+    static std::array<std::atomic<bool>, 16> configured{};
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    if (device >= 0 && device < 16 && !configured[static_cast<std::size_t>(device)].exchange(true)) {
+            cudaFuncSetAttribute(gate_up_kernel_a16<Columns>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                         static_cast<int>(sizeof(GateUpShared16<Columns>)));
+            cudaFuncSetAttribute(down_kernel_a16<Columns>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                         static_cast<int>(sizeof(DownShared16<Columns>)));
+            cudaFuncSetAttribute(gate_up_kernel_a16<Columns>, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                         cudaSharedmemCarveoutMaxShared);
+            cudaFuncSetAttribute(down_kernel_a16<Columns>, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                         cudaSharedmemCarveoutMaxShared);
+    }
     gate_up_kernel_a16<Columns><<<dim3(kGateUpCtas, jobs), kThreads, sizeof(GateUpShared16<Columns>), stream>>>(
         x, moe::kHidden, dispatch, source, top_k, job_records, flags, base, h_plane, phase);
     check_launch("A16 gate/up");

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <numeric>
 #include <stdexcept>
@@ -240,6 +241,7 @@ void RemoteExpertService::record_failure(std::string what) noexcept {
     try {
         const std::lock_guard<std::mutex> lock(mutex_);
         failure_ = what.empty() ? std::string("unknown exception") : std::move(what);
+        std::fprintf(stderr, "remote expert service stopped: %s\n", failure_.c_str());
     } catch (...) {}
 }
 
