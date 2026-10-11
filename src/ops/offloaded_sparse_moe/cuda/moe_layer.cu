@@ -1921,7 +1921,7 @@ __global__ void __launch_bounds__(kThreads)
 // A tile list (job, first column) is built on the device per pass, from the jobs the narrow passes
 // skip (moe::wide_route), so every expert is computed by exactly one route.
 
-constexpr int kWmmaRows = 64, kWmmaCols = 64, kWmmaK = 32; // K per step: two A4 blocks
+constexpr int kWmmaRows = 64, kWmmaCols = 64, kWmmaK = 64; // K per step: four A4 blocks
 constexpr int kWmmaLd   = kWmmaK + 8;                       // halves; keeps rows 16-byte aligned
 
 __device__ __forceinline__ float e2m1_float(unsigned code) { return 0.5F * static_cast<float>(canon::e2m1_x2(code)); }
@@ -2016,51 +2016,80 @@ struct WmmaShared {
     union {
         struct {
             __half a[kWmmaRows][kWmmaLd]; // weights, row-major
+            __half b[kWmmaCols][kWmmaLd]; // columns, [column][k] = col-major K x N
         } step;
         float c[kWmmaRows][kWmmaCols + 4];
     };
 };
 
-// One step's weights into sm.step.a: the 8 units of 4 row groups x 2 K blocks, one 32-bit code word
-// (rows i and i + 8 of a unit at k = 4q .. 4q + 3) per thread. In the record layout word w of a unit
-// is q = w / 8, i = w % 8; in the row-pair layout q = w % 4, i = w / 4.
+// A step covers 4 row groups x 4 K blocks = 16 units of 32 code words (two per thread) and 64
+// columns x 64 K values = 512 16-byte vectors (two per thread). Word w of a unit holds rows i and
+// i + 8 at k = 4q .. 4q + 3: in the record layout q = w / 8, i = w % 8; in the row-pair layout
+// q = w % 4, i = w / 4.
+struct WmmaStepRegisters {
+    std::uint32_t word[2];
+    std::uint8_t scale_lo[2], scale_hi[2];
+    uint4 column[2];
+};
+
 template <int Blocks>
-__device__ __forceinline__ void wmma_widen_weights(WmmaShared& sm, const std::uint8_t* matrix, int row_tile, int b0,
-                                                   bool row_pairs) {
-    const int t = static_cast<int>(threadIdx.x);
-    const int u = t / 32, w = t % 32;                 // unit of the step, its code word
-    const int group = u / 2, kb = u % 2;              // row group in the tile, K block in the step
-    const int q = row_pairs ? w % 4 : w / 8, i = row_pairs ? w / 4 : w % 8;
-    const std::uint8_t* unit =
-        matrix + (static_cast<std::size_t>(4 * row_tile + group) * Blocks + b0 + kb) * moe::kUnitBytes;
-    const std::uint32_t word = __ldg(reinterpret_cast<const std::uint32_t*>(unit) + w);
-    const float s_lo = canon::e4m3_value(__ldg(unit + 128 + i)), s_hi = canon::e4m3_value(__ldg(unit + 128 + 8 + i));
-    __half* lo = &sm.step.a[16 * group + i][16 * kb + 4 * q];
-    __half* hi = &sm.step.a[16 * group + 8 + i][16 * kb + 4 * q];
+__device__ __forceinline__ void wmma_load_step(WmmaStepRegisters& r, const std::uint8_t* matrix, int row_tile, int b0,
+                                               bool row_pairs, const __half* columns, int ld) {
 #pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const unsigned byte = (word >> (8 * j)) & 255U;
-        lo[j] = __float2half_rn(e2m1_float(byte & 15U) * s_lo);
-        hi[j] = __float2half_rn(e2m1_float(byte >> 4) * s_hi);
+    for (int h = 0; h < 2; ++h) {
+        const int t = static_cast<int>(threadIdx.x) + h * kThreads;
+        const int u = t / 32, w = t % 32, group = u / 4, kb = u % 4;
+        const int i = row_pairs ? w / 4 : w % 8;
+        const std::uint8_t* unit =
+            matrix + (static_cast<std::size_t>(4 * row_tile + group) * Blocks + b0 + kb) * moe::kUnitBytes;
+        r.word[h]     = __ldg(reinterpret_cast<const std::uint32_t*>(unit) + w);
+        r.scale_lo[h] = __ldg(unit + 128 + i);
+        r.scale_hi[h] = __ldg(unit + 128 + 8 + i);
+        const int c = t / 8, v = t % 8; // column, its 16-byte vector (8 K values)
+        r.column[h] = __ldg(reinterpret_cast<const uint4*>(columns + static_cast<std::size_t>(c) * ld + 16 * b0) + v);
+    }
+}
+
+__device__ __forceinline__ void wmma_store_step(const WmmaStepRegisters& r, WmmaShared& sm, bool row_pairs) {
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        const int t = static_cast<int>(threadIdx.x) + h * kThreads;
+        const int u = t / 32, w = t % 32, group = u / 4, kb = u % 4;
+        const int q = row_pairs ? w % 4 : w / 8, i = row_pairs ? w / 4 : w % 8;
+        const float s_lo = canon::e4m3_value(r.scale_lo[h]), s_hi = canon::e4m3_value(r.scale_hi[h]);
+        __half* lo = &sm.step.a[16 * group + i][16 * kb + 4 * q];
+        __half* hi = &sm.step.a[16 * group + 8 + i][16 * kb + 4 * q];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const unsigned byte = (r.word[h] >> (8 * j)) & 255U;
+            lo[j] = __float2half_rn(e2m1_float(byte & 15U) * s_lo);
+            hi[j] = __float2half_rn(e2m1_float(byte >> 4) * s_hi);
+        }
+        const int c = t / 8, v = t % 8;
+        *reinterpret_cast<uint4*>(&sm.step.b[c][8 * v]) = r.column[h];
     }
 }
 
 // The tile's FP32 sums over K for rows [64 * row_tile, +64) of a matrix of `Blocks` K blocks, against
-// the columns' FP16 values: column c's K values at columns + c * ld (col-major K x N, from global).
+// the columns' FP16 values: column c's K values at columns + c * ld (from global; columns past the
+// tile's are read from the planes' padding and their sums discarded).
 template <int Blocks>
 __device__ void wmma_tile(WmmaShared& sm, const std::uint8_t* matrix, int row_tile, bool row_pairs, int n,
                           const __half* columns, int ld) {
     using namespace nvcuda;
-    static_assert(kThreads == 256 && kWmmaK == 32, "one code word per thread and step");
+    static_assert(kThreads == 256 && kWmmaK == 64 && Blocks % 4 == 0, "two words and two vectors per thread and step");
     const int warp = threadIdx.x / 32;
     const int wr = warp / 2, wc = (warp % 2) * 2; // a 16-row slab, two 16-column slabs
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2];
     wmma::fill_fragment(acc[0], 0.0F);
     wmma::fill_fragment(acc[1], 0.0F);
-    const int slabs = (n + 15) / 16; // column slabs holding columns
-    for (int b0 = 0; b0 < Blocks; b0 += 2) {
-        wmma_widen_weights<Blocks>(sm, matrix, row_tile, b0, row_pairs);
+    const int slabs = (n + 15) / 16;
+    WmmaStepRegisters r;
+    wmma_load_step<Blocks>(r, matrix, row_tile, 0, row_pairs, columns, ld);
+    for (int b0 = 0; b0 < Blocks; b0 += 4) {
+        wmma_store_step(r, sm, row_pairs);
         __syncthreads();
+        if (b0 + 4 < Blocks) { wmma_load_step<Blocks>(r, matrix, row_tile, b0 + 4, row_pairs, columns, ld); }
         wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
         wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
 #pragma unroll
@@ -2069,7 +2098,7 @@ __device__ void wmma_tile(WmmaShared& sm, const std::uint8_t* matrix, int row_ti
 #pragma unroll
             for (int t = 0; t < 2; ++t) {
                 if (wc + t < slabs) { // warp-uniform
-                    wmma::load_matrix_sync(fb, columns + static_cast<std::size_t>(16 * (wc + t)) * ld + 16 * b0 + ks, ld);
+                    wmma::load_matrix_sync(fb, &sm.step.b[16 * (wc + t)][ks], kWmmaLd);
                     wmma::mma_sync(acc[t], fa, fb, acc[t]);
                 }
             }
