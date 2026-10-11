@@ -66,14 +66,16 @@ struct DispatchLayout {
 DispatchLayout dispatch_layout(std::uint32_t experts) {
     DispatchLayout d{};
     std::size_t at = 0;
+    // Fixed arrays first, then the call's entries and right after them its entry list, so one copy
+    // of (head + 2 * entries) ints uploads a request (a decode call: ~8 KiB, not the whole block).
     d.counts     = at; at += experts;
     d.offsets    = at; at += experts + 1;
     d.cursor     = at; at += experts;
-    d.entries    = at; at += kMaxRemoteEntries;
     d.jobs       = at; at += experts;
     d.job_count  = at; at += 1;
-    d.entry_list = at; at += kMaxRemoteEntries;
-    d.total      = at;
+    d.entries    = at; at += kMaxRemoteEntries;
+    d.entry_list = 0; // d.entries + the call's entries
+    d.total      = at + kMaxRemoteEntries;
     return d;
 }
 
@@ -276,6 +278,7 @@ void RemoteExpertService::serve() {
             std::atomic_thread_fence(std::memory_order_acquire);
             seen             = sequence;
             const auto start = std::chrono::steady_clock::now();
+            auto enqueued          = start;
             const RemoteRequest& r = *request_;
             const int layer = r.layer, columns = r.columns, top_k = r.top_k, jobs = r.jobs, entries = r.entries;
             std::uint32_t status = 0;
@@ -314,9 +317,11 @@ void RemoteExpertService::serve() {
                     for (int c = 0; c < r.count[j]; ++c) { s[d.entries + at + c] = r.entry[r.first[j] + c]; }
                 }
                 s[d.job_count] = jobs;
-                std::memcpy(s + d.entry_list, r.entry, sizeof(std::int32_t) * static_cast<std::size_t>(entries));
+                const std::size_t list = d.entries + static_cast<std::size_t>(entries);
+                std::memcpy(s + list, r.entry, sizeof(std::int32_t) * static_cast<std::size_t>(entries));
                 if (status == 0) {
-                    require_cuda(cudaMemcpyAsync(dispatch_, s, d.total * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream),
+                    require_cuda(cudaMemcpyAsync(dispatch_, s, (list + static_cast<std::size_t>(entries)) * sizeof(std::int32_t),
+                                                 cudaMemcpyHostToDevice, stream),
                                  "upload dispatch");
                     require_cuda(cudaMemcpyAsync(x_device_, x_, sizeof(std::uint16_t) * kHidden * columns,
                                                  cudaMemcpyHostToDevice, stream),
@@ -341,9 +346,10 @@ void RemoteExpertService::serve() {
                     const int vectors = kHidden * 2 / 16;
                     const int blocks  = std::min(1024, (entries * vectors + 255) / 256);
                     gather_kernel<<<blocks, 256, 0, stream>>>(reinterpret_cast<const int4*>(outputs_),
-                                                             dispatch_ + d.entry_list, entries, vectors,
+                                                             dispatch_ + list, entries, vectors,
                                                              reinterpret_cast<int4*>(y_));
                     require_cuda(cudaGetLastError(), "gather");
+                    enqueued = std::chrono::steady_clock::now();
                     cudaError_t state = cudaErrorNotReady;
                     while ((state = cudaStreamQuery(stream)) == cudaErrorNotReady) {
                         *volatile_beat = ++beat;
@@ -355,13 +361,18 @@ void RemoteExpertService::serve() {
             *volatile_status = status;
             std::atomic_thread_fence(std::memory_order_release);
             *volatile_done = sequence;
-            const auto busy = std::chrono::steady_clock::now() - start;
+            const auto end  = std::chrono::steady_clock::now();
+            const auto busy = end - start;
             {
                 const std::lock_guard<std::mutex> lock(mutex_);
                 ++stats_.requests;
                 stats_.jobs += static_cast<std::uint64_t>(jobs);
                 stats_.entries += static_cast<std::uint64_t>(entries);
                 stats_.busy_ns += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(busy).count());
+                stats_.enqueue_ns += static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(enqueued - start).count());
+                stats_.wait_ns += static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(end - enqueued).count());
             }
             last  = std::chrono::steady_clock::now();
             polls = 0;

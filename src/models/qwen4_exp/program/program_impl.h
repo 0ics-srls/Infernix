@@ -2605,10 +2605,12 @@ private:
                 const auto r = remote_->stats();
                 std::snprintf(text, sizeof(text),
                               "second GPU: since start %llu requests, %llu experts, %llu expert columns, %.1f us per "
-                              "request (request seen to answer written), %.2f s busy",
+                              "request (request seen to answer written: %.1f us host, %.1f us on the GPU), %.2f s busy",
                               static_cast<unsigned long long>(r.requests), static_cast<unsigned long long>(r.jobs),
                               static_cast<unsigned long long>(r.entries),
                               r.requests ? 1e-3 * static_cast<double>(r.busy_ns) / static_cast<double>(r.requests) : 0.0,
+                              r.requests ? 1e-3 * static_cast<double>(r.enqueue_ns) / static_cast<double>(r.requests) : 0.0,
+                              r.requests ? 1e-3 * static_cast<double>(r.wait_ns) / static_cast<double>(r.requests) : 0.0,
                               1e-9 * static_cast<double>(r.busy_ns));
                 diagnostic(text, DiagnosticLevel::Debug);
             }
