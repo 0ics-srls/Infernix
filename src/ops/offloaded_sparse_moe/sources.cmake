@@ -24,7 +24,9 @@ add_library(infernix_offloaded_moe_cuda STATIC
   # A whole MoE layer: routing, device-side dispatch, the exact expert kernels and the combine.
   "${CMAKE_CURRENT_LIST_DIR}/cuda/moe_layer.cu"
   # The wide route: experts with more than eight columns on block-scaled tensor cores.
-  "${CMAKE_CURRENT_LIST_DIR}/cuda/wide_expert.cu")
+  "${CMAKE_CURRENT_LIST_DIR}/cuda/wide_expert.cu"
+  # The second GPU's expert service (the V100): the same kernels on the experts it holds.
+  "${CMAKE_CURRENT_LIST_DIR}/cuda/remote_experts.cu")
 infernix_internal_includes(infernix_offloaded_moe_cuda)
 infernix_cuda_non_rdc_archive(infernix_offloaded_moe_cuda)
 if(CMAKE_CUDA_ARCHITECTURES STREQUAL "89")

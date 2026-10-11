@@ -3,6 +3,7 @@
 #include "core/tensor.h"
 #include "ops/offloaded_sparse_moe/cpu/fetch_request.h"
 #include "ops/offloaded_sparse_moe/cpu/miss_request.h"
+#include "ops/offloaded_sparse_moe/cpu/remote_request.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a4_expert.h"
 
 #include <cuda_runtime.h>
@@ -139,6 +140,26 @@ struct MoeFetchChannel {
     std::int32_t layer                          = 0;
 };
 
+/// Experts a second GPU holds and computes (the V100 of the V100 + RTX 4090 pair; protocol in
+/// ops/offloaded_sparse_moe/cpu/remote_request.h, service in cuda/remote_experts.h). When `held`
+/// is set, every non-resident expert with held[e] >= 0 (and not streamed) is served by that GPU, at
+/// any column count: the call publishes x and the experts' entries, computes its own experts and
+/// the shared expert meanwhile, and moe_experts_cpu_wait places the service's outputs. The service
+/// runs the same exact kernels, so where an expert is computed never changes a bit. Such experts
+/// are never CPU-served, staged or fetched.
+struct MoeRemoteChannel {
+    const std::int32_t* held                 = nullptr; // device [E] of the call's GPU: slot on the remote GPU, or -1
+    offloaded_moe::RemoteRequest* request    = nullptr; // mapped host memory
+    std::uint16_t* x                         = nullptr; // mapped BF16 [H, kMaxRemoteColumns]
+    const std::uint16_t* y                   = nullptr; // mapped BF16 [H, kMaxRemoteEntries]
+    const std::uint32_t* done                = nullptr; // mapped; the service writes the answered sequence
+    const std::uint32_t* status              = nullptr; // mapped; 0 or an errno, written before done
+    const std::uint32_t* heartbeat           = nullptr; // mapped; changes while the service is alive
+    std::uint32_t* sequence                  = nullptr; // device counter of published requests
+    offloaded_moe::RemoteCall* call          = nullptr; // device bookkeeping of the outstanding request
+    std::int32_t layer                       = 0;
+};
+
 struct MoeExpertSource {
     const std::uint8_t* frame_base   = nullptr;
     const std::int32_t* frames       = nullptr; // device [E]
@@ -165,6 +186,7 @@ struct MoeExpertSource {
     std::int32_t staging_slots  = 0;
     MoeCpuChannel cpu;
     MoeFetchChannel fetch; // with host_table only; needs staging_slots > 0 and max_jobs <= kMaxFetch
+    MoeRemoteChannel remote; // experts held by a second GPU (held == nullptr: none)
     // Optional overlap of staging with compute for calls of several passes (prefill chunks): the
     // slots are split in two halves and pass p+1 is staged on `overlap_stream` while pass p
     // computes. The stream and the five events (start, staged[2], consumed[2]) are caller-owned;

@@ -113,6 +113,12 @@ __device__ __forceinline__ void stage_wait() {
 }
 
 // A non-resident expert's host record (MoeExpertSource::host_table, else the pinned bank).
+// Whether a second GPU holds the expert (MoeRemoteChannel): it is then neither CPU-served, staged nor
+// fetched on this GPU.
+__device__ __forceinline__ bool remote_held(const MoeExpertSource& source, int expert) {
+    return source.remote.held != nullptr && source.remote.held[expert] >= 0;
+}
+
 __device__ __forceinline__ const std::uint8_t* host_record(const MoeExpertSource& source, int expert) {
     return source.host_table != nullptr ? source.host_table[expert]
                                         : source.host_records + static_cast<std::uint64_t>(expert) * source.record_stride;
@@ -1413,7 +1419,10 @@ __global__ void __launch_bounds__(kThreads)
     for (int j = threadIdx.x; j < jobs; j += blockDim.x) {
         const int expert = dispatch.jobs[j];
         // A streamed record counts as resident: neither staged nor CPU-served.
-        if (source.frames[expert] >= 0 || (source.prefetched != nullptr && source.prefetched[expert] >= 0)) { continue; }
+        if (source.frames[expert] >= 0 || (source.prefetched != nullptr && source.prefetched[expert] >= 0) ||
+            remote_held(source, expert)) {
+            continue;
+        }
         const bool ssd  = source.host_table != nullptr && source.host_table[expert] == nullptr;
         own += ssd ? 0 : 1;
         const int count = dispatch.offsets[expert + 1] - dispatch.offsets[expert];
@@ -1451,7 +1460,8 @@ __global__ void __launch_bounds__(kThreads)
         int width = 0, cat = 0, expert = -1, first = 0;
         if (j < jobs) {
             expert = dispatch.jobs[j];
-            if (source.frames[expert] < 0 && (source.prefetched == nullptr || source.prefetched[expert] < 0)) {
+            if (source.frames[expert] < 0 && (source.prefetched == nullptr || source.prefetched[expert] < 0) &&
+                !remote_held(source, expert)) {
                 first           = dispatch.offsets[expert];
                 const int count = dispatch.offsets[expert + 1] - first;
                 width           = count <= max_width ? count : 0;
@@ -1658,6 +1668,133 @@ __global__ void __launch_bounds__(kThreads)
     }
 }
 
+// ---------------------------------------------------------------- remote experts (a second GPU)
+
+// One CTA: every non-resident, non-streamed expert the remote GPU holds becomes a remote job,
+// flagged so this GPU's passes, staging and fetches skip it. Its entries go to the request (and the
+// call's device copy) in job order; the call's x was copied to the mapped x before this kernel. Job
+// order follows the atomic slots, which changes no bit: each output column is one expert's.
+// zero_flags: no CPU plan ran before this kernel to clear the flags.
+__global__ void __launch_bounds__(kThreads)
+    remote_plan_kernel(MoeDispatch dispatch, MoeExpertSource source, int columns, int top_k, int max_jobs,
+                       std::int32_t* __restrict__ flags, int zero_flags) {
+    __shared__ int jobs_n, entries_n;
+    const MoeRemoteChannel& channel  = source.remote;
+    offloaded_moe::RemoteRequest* r  = channel.request;
+    offloaded_moe::RemoteCall* call  = channel.call;
+    const int jobs                   = min(*dispatch.job_count, max_jobs);
+    if (zero_flags != 0) {
+        for (int j = threadIdx.x; j < max_jobs; j += blockDim.x) { flags[j] = 0; }
+    }
+    if (threadIdx.x == 0) {
+        jobs_n    = 0;
+        entries_n = 0;
+    }
+    __syncthreads();
+    for (int j = threadIdx.x; j < jobs; j += blockDim.x) {
+        const int expert = dispatch.jobs[j];
+        if (source.frames[expert] >= 0 || (source.prefetched != nullptr && source.prefetched[expert] >= 0) ||
+            channel.held[expert] < 0 || flags[j] != 0) {
+            continue;
+        }
+        const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
+        const int slot  = atomicAdd(&jobs_n, 1);
+        const int at    = atomicAdd(&entries_n, count);
+        flags[j]        = 1;
+        r->expert[slot] = expert;
+        r->first[slot]  = at;
+        r->count[slot]  = count;
+        for (int c = 0; c < count; ++c) {
+            const int entry  = dispatch.entries[first + c];
+            r->entry[at + c] = entry;
+            call->entry[at + c] = entry;
+        }
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        call->jobs    = jobs_n;
+        call->entries = entries_n;
+        if (jobs_n == 0) {
+            call->pending = 0;
+            return;
+        }
+        r->layer   = channel.layer;
+        r->columns = columns;
+        r->top_k   = top_k;
+        r->jobs    = jobs_n;
+        r->entries = entries_n;
+        std::uint32_t sequence = *channel.sequence + 1U;
+        if (sequence == 0) { sequence = 1; }
+        *channel.sequence = sequence;
+        call->pending     = static_cast<std::int32_t>(sequence);
+        __threadfence_system();
+        asm volatile("st.release.sys.global.u32 [%0], %1;" ::"l"(&r->sequence), "r"(sequence) : "memory");
+    }
+}
+
+constexpr int kRemoteWaitCtas = 16;
+
+// kRemoteWaitCtas CTAs: each waits for the service's answer to the call's request (while its
+// heartbeat changes), then places its share of the y columns at their entries in `outputs`.
+__global__ void __launch_bounds__(kThreads)
+    remote_wait_kernel(MoeExpertSource source, int hidden, bf16* __restrict__ outputs) {
+    const MoeRemoteChannel& channel       = source.remote;
+    const offloaded_moe::RemoteCall* call = channel.call;
+    const auto sequence                   = static_cast<std::uint32_t>(call->pending);
+    if (sequence == 0) { return; }
+    __shared__ bool silent;
+    if (threadIdx.x == 0) {
+        const auto* done   = reinterpret_cast<const volatile std::uint32_t*>(channel.done);
+        const auto* beat   = reinterpret_cast<const volatile std::uint32_t*>(channel.heartbeat);
+        std::uint32_t seen = beat != nullptr ? *beat : 0;
+        std::uint64_t since = global_ns();
+        const std::uint64_t limit = beat != nullptr ? offloaded_moe::kHeartbeatTimeoutNs : 2000000000ULL;
+        silent = false;
+        while (*done != sequence) {
+            const std::uint64_t now = global_ns();
+            if (beat != nullptr && *beat != seen) {
+                seen  = *beat;
+                since = now;
+            } else if (now - since > limit) {
+                if (beat == nullptr || source.error == nullptr) { asm volatile("trap;"); }
+                report_error(source, offloaded_moe::kErrorHostSilent);
+                silent = true;
+                break;
+            }
+            __nanosleep(200);
+        }
+        __threadfence_system();
+        if (!silent && blockIdx.x == 0 && channel.status != nullptr) {
+            const std::uint32_t status = *reinterpret_cast<const volatile std::uint32_t*>(channel.status);
+            if (status != 0) { report_error(source, status); }
+        }
+    }
+    __syncthreads();
+    if (silent) { return; }
+    constexpr int kBatch = 8;
+    const int vectors    = hidden * 2 / 16; // 16-byte vectors per column
+    const int items      = call->entries * vectors;
+    const auto* y        = reinterpret_cast<const int4*>(channel.y);
+    auto* out            = reinterpret_cast<int4*>(outputs);
+    const int stride     = static_cast<int>(gridDim.x * blockDim.x);
+    for (int base = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x); base < items; base += kBatch * stride) {
+        int4 loaded[kBatch];
+#pragma unroll
+        for (int b = 0; b < kBatch; ++b) {
+            const int item = base + b * stride;
+            if (item < items) { loaded[b] = __ldcv(y + item); }
+        }
+#pragma unroll
+        for (int b = 0; b < kBatch; ++b) {
+            const int item = base + b * stride;
+            if (item < items) {
+                out[static_cast<std::size_t>(call->entry[item / vectors]) * vectors + item % vectors] = loaded[b];
+            }
+        }
+    }
+}
+
 // --------------------------------------------------------------------------------------- combine
 
 __global__ void combine_kernel(const bf16* __restrict__ outputs, const float* __restrict__ weights,
@@ -1769,11 +1906,18 @@ bool cpu_served(const Tensor& x, const MoeExpertSource& source) {
 
 bool fetch_served(const MoeExpertSource& source) { return source.fetch.request != nullptr; }
 
+bool remote_served(const MoeExpertSource& source) { return source.remote.held != nullptr; }
+
 } // namespace
 
 void moe_experts_cpu_wait(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source,
                           std::int32_t max_jobs, void* workspace, Tensor& outputs, cudaStream_t stream) {
     if (forked(source, max_jobs, x.ne[1])) { CUDA_CHECK(cudaStreamWaitEvent(stream, source.fork_events[1], 0)); }
+    if (remote_served(source)) {
+        remote_wait_kernel<<<kRemoteWaitCtas, kThreads, 0, stream>>>(source, moe::kHidden,
+                                                                    static_cast<bf16*>(outputs.data));
+        check_launch("remote wait");
+    }
     if (!cpu_served(x, source)) { return; }
     CpuCall* call    = cpu_call_of(workspace, x, source, max_jobs, outputs.ne[1], nullptr);
     bool warm        = false;
@@ -1823,6 +1967,20 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
                                                     max_jobs, cpu_flags, cpu_call);
         check_launch("cpu plan");
     }
+    const bool remote = remote_served(source);
+    if (remote) {
+        // The second GPU's experts (MoeRemoteChannel): x goes to the mapped buffer in stream order,
+        // then the plan flags the held experts and publishes them; the CPU plan already left them.
+        require(source.remote.request != nullptr && source.remote.x != nullptr && source.remote.y != nullptr &&
+                    source.remote.done != nullptr && source.remote.sequence != nullptr && source.remote.call != nullptr &&
+                    x.ne[1] <= offloaded_moe::kMaxRemoteColumns && outputs.ne[1] <= offloaded_moe::kMaxRemoteEntries &&
+                    max_jobs <= offloaded_moe::kMaxRemoteJobs,
+                "remote expert channel is incomplete or the call exceeds it");
+        CUDA_CHECK(cudaMemcpyAsync(source.remote.x, x.data, static_cast<std::size_t>(x.ne[0]) * x.ne[1] * sizeof(bf16),
+                                   cudaMemcpyDeviceToHost, stream));
+        remote_plan_kernel<<<1, kThreads, 0, stream>>>(dispatch, source, x.ne[1], top_k, max_jobs, cpu_flags, cpu ? 0 : 1);
+        check_launch("remote plan");
+    }
     FetchCall* fetch = nullptr;
     if (fetch_served(source)) {
         require(source.host_table != nullptr && source.fetch.response != nullptr && source.fetch.consumed != nullptr &&
@@ -1830,11 +1988,11 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
                     source.staging_slots > 0 && max_jobs <= offloaded_moe::kMaxFetch,
                 "experts fetch channel is incomplete (it needs a host table, staging and at most kMaxFetch jobs)");
         fetch = fetch_call_of(workspace, x, source, max_jobs, outputs.ne[1]);
-        fetch_plan_kernel<<<1, kThreads, 0, stream>>>(dispatch, source, max_jobs, cpu ? cpu_flags : nullptr,
+        fetch_plan_kernel<<<1, kThreads, 0, stream>>>(dispatch, source, max_jobs, cpu || remote ? cpu_flags : nullptr,
                                                       cpu ? cpu_call : nullptr, fetch);
         check_launch("fetch plan");
     }
-    const std::int32_t* flags = cpu ? cpu_flags : nullptr;
+    const std::int32_t* flags = cpu || remote ? cpu_flags : nullptr;
     // Passes of at most staging_slots jobs (one pass covering every job without staging).
     const int pass_jobs = source.staging_slots > 0 ? std::min(source.staging_slots, kMaxPassJobs) : max_jobs;
     const int half      = source.staging_slots / 2;
