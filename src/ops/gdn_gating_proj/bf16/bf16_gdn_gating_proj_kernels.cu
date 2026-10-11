@@ -357,8 +357,26 @@ bool launch_bf16_prefill_mma(Bf16GdnGatingTokenVariant variant, const Tensor& x,
     } else {
         constexpr std::int64_t kCtasPerTokenTile =
             static_cast<std::int64_t>(Geometry::kHeads / kBf16GdnBlockM) * SplitK;
-        constexpr std::int32_t kResidentCtasPerSm =
-            cooperative_resident_ctas_per_sm<Geometry, SplitK>();
+        // The upstream count was qualified on sm_120a; other devices (sm_89, sm_70) have a different
+        // register file and shared memory, so the driver's occupancy of both kernel variants caps it.
+        static const std::int32_t kResidentCtasPerSm = [&] {
+            std::int32_t resident = cooperative_resident_ctas_per_sm<Geometry, SplitK>();
+            int full = 0, partial = 0;
+            CUDA_CHECK(cudaFuncSetAttribute(
+                bf16_gdn_gating_proj_gemm_mma_kernel<Geometry, SplitK, true, Warps, NormalizeInput, NormTokenCapacity>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+            CUDA_CHECK(cudaFuncSetAttribute(
+                bf16_gdn_gating_proj_gemm_mma_kernel<Geometry, SplitK, false, Warps, NormalizeInput, NormTokenCapacity>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+            CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &full, bf16_gdn_gating_proj_gemm_mma_kernel<Geometry, SplitK, true, Warps, NormalizeInput, NormTokenCapacity>,
+                static_cast<int>(block.x), kSmemBytes));
+            CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &partial, bf16_gdn_gating_proj_gemm_mma_kernel<Geometry, SplitK, false, Warps, NormalizeInput, NormTokenCapacity>,
+                static_cast<int>(block.x), kSmemBytes));
+            resident = std::min<std::int32_t>(resident, std::min(full, partial));
+            return resident;
+        }();
         const std::int64_t resident_ctas =
             static_cast<std::int64_t>(multiprocessor_count) * kResidentCtasPerSm;
         const std::int64_t max_token_tiles = resident_ctas / kCtasPerTokenTile;

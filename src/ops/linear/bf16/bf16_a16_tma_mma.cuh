@@ -2,7 +2,9 @@
 
 #include "ops/common/arch.cuh"
 
+#include "core/device_arch.h"
 #include "core/tma_descriptor_staging.cuh"
+#include "ops/linear/bf16/bf16_a16_mma.cuh"
 #include "ops/common/mbarrier.cuh"
 #include "ops/linear/bf16/bf16_mma_common.cuh"
 #include "ops/linear/bf16/bf16_operands.h"
@@ -181,9 +183,44 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_t
                                                token_begin, rows, token_offset + count, warp, lane);
 }
 
+// A TMA schedule's tiles on the cp.async MMA kernel, for devices without TMA (sm_89, sm_70): the
+// TMA schedule derives from Bf16A16MmaSchedule with the same tile parameters, so only the producer
+// warp, the TMA swizzle and the barrier bytes go.
+template <class Schedule>
+struct Bf16CpAsyncTwin : Schedule {
+    static constexpr Bf16MmaSwizzle kSwizzle = Bf16MmaSwizzle::Xor64;
+    static constexpr int kThreads            = Schedule::kWarps * 32;
+    static constexpr int kSharedBytes =
+        Schedule::kStages * (Schedule::kBlockRows + Schedule::kBlockTokens) * Schedule::kBlockK * 2;
+};
+
 template <class Schedule, class Output, class Epilogue>
 void launch_bf16_a16_tma_mma(const Bf16A16Operands& p, Output output, Epilogue epilogue,
                              cudaStream_t stream) {
+    if (!device_has_tma()) {
+        // RTX 4090 / V100: the same tiles on the cp.async MMA kernel (Bf16CpAsyncTwin).
+        using Twin = Bf16CpAsyncTwin<Schedule>;
+        for_each_token_slice(p.tokens, Twin::kBlockTokens, [&](int offset, int count) {
+            const auto blocks = static_cast<std::int64_t>(bf16_predicated_rows<Twin>
+                                                              ? div_up(p.rows, Twin::kBlockRows)
+                                                              : p.rows / Twin::kBlockRows) *
+                                div_up(count, Twin::kBlockTokens);
+            if (blocks > 2147483647LL)
+                throw std::invalid_argument("BF16 MMA grid exceeds CUDA grid.x capacity");
+            const auto launch = [&]<bool Full>() {
+                constexpr auto kernel = bf16_a16_mma_kernel<Twin, Full, Output, Epilogue, 1>;
+                const int bytes = bf16_prepare_shared<bf16_mma_shared_bytes<Twin, Epilogue>, kernel>();
+                kernel<<<dim3(static_cast<unsigned>(blocks), 1, 1), Twin::kThreads, bytes, stream>>>(
+                    p.x, p.weight, output, epilogue, p.rows, p.k, offset, count);
+                CUDA_CHECK(cudaGetLastError());
+            };
+            if (count % Twin::kBlockTokens == 0)
+                launch.template operator()<true>();
+            else
+                launch.template operator()<false>();
+        });
+        return;
+    }
     // Descriptors are launch-owned values, copied into kernel parameters during Graph capture.
     const auto descriptors = make_bf16_tma_descriptors<Schedule>(p);
 #ifdef _WIN32

@@ -26,6 +26,8 @@
 
 #include "infernix/ops/offloaded_sparse_moe.h"
 
+#include "core/device_arch.h"
+#include "ops/common/arch.cuh"
 #include "ops/common/canonical_math.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a4_expert.h"
 
@@ -43,9 +45,21 @@ namespace infernix::ops::offloaded_moe {
 #endif
 
 // The route of one expert in one call: a function of its column count and its stored scales only.
+// Below sm_120 (the RTX 4090 and V100 of this fork) there is no FP4 tensor-core MMA: every expert
+// takes the narrow route, whose exact integer sums run in passes of eight columns at any width and
+// equal the CPU engine's bits. The host side asks wide_route_available() before planning the route.
 INFERNIX_WIDE_HD bool wide_route(int columns, const ExpertScales& scales) {
+#if !INFERNIX_DEVICE_SM120
+    (void)columns;
+    (void)scales;
+    return false;
+#else
     return columns > kMaxColumns && scales.input_gate == scales.input_up;
+#endif
 }
+
+// Whether the current device has the wide route (compute capability 12.x); host code only.
+inline bool wide_route_available() noexcept { return device_has_fp4_mma(); }
 
 namespace wide {
 

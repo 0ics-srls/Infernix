@@ -1828,7 +1828,8 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     const int half      = source.staging_slots / 2;
     // In a call of more than eight columns, experts with more than eight take the wide route, pass
     // by pass once each pass's records are resolved; it is planned and x quantized before the passes.
-    const bool use_wide = x.ne[1] > moe::kMaxColumns && !forked(source, max_jobs, x.ne[1]);
+    const bool use_wide = x.ne[1] > moe::kMaxColumns && !forked(source, max_jobs, x.ne[1]) &&
+                          moe::wide_route_available();
     // The staging overlap is not combined with the wide route: in the Program, overlapped calls with
     // wide experts gave run-to-run differences (prefix-cache exactness failures, varying greedy ids;
     // design §19.3.8, "F1 nondeterminism") that serial passes do not; the cause is not identified.
