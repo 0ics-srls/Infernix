@@ -1444,13 +1444,13 @@ void launch_expert_pass_a16(const bf16* x, const MoeDispatch& dispatch, const Mo
 
 // One pass of the narrow kernels in the source's arithmetic; `few` selects the one-column kernels
 // (calls of at most kNarrowPassColumns columns: decode and MTP verification).
-void launch_pass(bool few, const bf16* x, const MoeDispatch& dispatch, const MoeExpertSource& source, int top_k,
+void launch_pass(int width, const bf16* x, const MoeDispatch& dispatch, const MoeExpertSource& source, int top_k,
                  const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
                  const moe::wide::ExpertsWorkspace& layout, int columns_out, bf16* outputs, cudaStream_t stream,
                  PassPhase phase = PassPhase::All) {
     if (source.activation == moe::ExpertActivation::kA16) {
         auto* h_plane = reinterpret_cast<std::uint16_t*>(layout.h_rows);
-        if (few) {
+        if (width == 1) {
             launch_expert_pass_a16<1>(x, dispatch, source, top_k, job_records, flags, base, jobs, h_plane, outputs,
                                       stream, phase);
         } else {
@@ -1459,10 +1459,20 @@ void launch_pass(bool few, const bf16* x, const MoeDispatch& dispatch, const Moe
         }
         return;
     }
-    if (few) {
+    switch (width) {
+    case 1:
         launch_expert_pass<1>(x, dispatch, source, top_k, job_records, flags, base, jobs, layout.h_blocks, columns_out,
                               outputs, stream, phase);
-    } else {
+        break;
+    case 2:
+        launch_expert_pass<2>(x, dispatch, source, top_k, job_records, flags, base, jobs, layout.h_blocks, columns_out,
+                              outputs, stream, phase);
+        break;
+    case 5:
+        launch_expert_pass<5>(x, dispatch, source, top_k, job_records, flags, base, jobs, layout.h_blocks, columns_out,
+                              outputs, stream, phase);
+        break;
+    default:
         launch_expert_pass<kPassColumns>(x, dispatch, source, top_k, job_records, flags, base, jobs, layout.h_blocks,
                                          columns_out, outputs, stream, phase);
     }
@@ -2046,6 +2056,16 @@ bool one_column_kernels() {
     return current_device_compute_major() >= 8;
 }
 
+// The narrow pass kernels for a call of `columns` columns: the one-column ones where they pay, else
+// the narrowest of 2, 5 and 8 columns that holds a job's columns in one pass (a decode call has at
+// most `columns` per job; wider jobs take several passes, as before).
+int pass_width(int columns) {
+    if (columns <= kNarrowPassColumns && one_column_kernels()) { return 1; }
+    if (columns <= 2) { return 2; }
+    if (columns <= 5) { return 5; }
+    return kPassColumns;
+}
+
 } // namespace
 
 void moe_experts_cpu_wait(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source,
@@ -2165,7 +2185,7 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
             check_launch("stage");
             CUDA_CHECK(cudaEventRecord(events[1 + b], source.overlap_stream));
             CUDA_CHECK(cudaStreamWaitEvent(stream, events[1 + b], 0));
-            launch_pass(false, static_cast<const bf16*>(x.data), dispatch, buffer, top_k, job_records, flags, base, jobs,
+            launch_pass(kPassColumns, static_cast<const bf16*>(x.data), dispatch, buffer, top_k, job_records, flags, base, jobs,
                         layout, outputs.ne[1], static_cast<bf16*>(outputs.data), stream);
             if (wide) { moe::wide::run_pass(*wide, pass, stream); }
             CUDA_CHECK(cudaEventRecord(events[3 + b], stream));
@@ -2184,7 +2204,7 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         check_launch("stage");
         const auto* xs = static_cast<const bf16*>(x.data);
         auto* out      = static_cast<bf16*>(outputs.data);
-        const bool few = x.ne[1] <= kNarrowPassColumns && one_column_kernels();
+        const int few = pass_width(x.ne[1]);
         launch_pass(few, xs, dispatch, source, top_k, job_records, flags, 0, max_jobs, layout, outputs.ne[1], out,
                     source.fork_stream, PassPhase::Staged);
         launch_pass(few, xs, dispatch, source, top_k, job_records, flags, 0, max_jobs, layout, outputs.ne[1], out, stream,
@@ -2212,7 +2232,7 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         // Calls of a few columns (decode, MTP verification) use the one-column kernels, which fit
         // two gate/up CTAs per SM; a job with several columns takes one pass per column over its
         // staged weights.
-        launch_pass(x.ne[1] <= kNarrowPassColumns && one_column_kernels(), static_cast<const bf16*>(x.data), dispatch, source, top_k,
+        launch_pass(pass_width(x.ne[1]), static_cast<const bf16*>(x.data), dispatch, source, top_k,
                     job_records, flags, base, jobs, layout, outputs.ne[1], static_cast<bf16*>(outputs.data), stream);
         if (wide) { moe::wide::run_pass(*wide, base / pass_jobs, stream); }
     }
