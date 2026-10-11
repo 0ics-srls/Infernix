@@ -47,6 +47,9 @@ public:
         // Copies in the row-pair unit layout the sm_70 kernels read with 16-byte loads
         // (MoeExpertSource::row_pair_units); requires record_stride == kRecordBytes.
         bool row_pair_units = true;
+        // The fast paths of the call (A4(x) plane once per entry, the widest job's kernels, no stage
+        // kernel); false runs the record path of moe_experts unchanged (the bench's reference).
+        bool fast_call = true;
     };
 
     explicit RemoteExpertService(Options options);
