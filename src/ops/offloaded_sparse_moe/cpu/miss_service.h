@@ -58,6 +58,9 @@ public:
     [[nodiscard]] MoeCpuChannel channel(int layer) const;
     [[nodiscard]] std::uint64_t served_requests() const noexcept { return served_.load(std::memory_order_relaxed); }
     [[nodiscard]] std::uint64_t served_experts() const noexcept { return experts_.load(std::memory_order_relaxed); }
+    // Time from a request seen to its answer written, summed (the V100 + RTX 4090 fork's diagnostics).
+    [[nodiscard]] std::uint64_t busy_ns() const noexcept { return busy_ns_.load(std::memory_order_relaxed); }
+    [[nodiscard]] std::uint64_t served_requests_total() const noexcept { return served_.load(std::memory_order_relaxed); }
     // Why the service thread stopped serving; empty while it serves. The device's wait for an
     // answer then times out (kErrorHostSilent) on every later call, so the caller treats a failed
     // service as fatal and reports this cause.
@@ -87,7 +90,7 @@ private:
     mutable std::atomic<std::uint32_t> wakes_{0};   // wake() calls the service thread has not seen yet
     void* wake_event_ = nullptr;             // Windows: auto-reset event wake() signals
     void* idle_timer_ = nullptr;             // Windows: the idle wait's high-resolution timer
-    std::atomic<std::uint64_t> served_{0}, experts_{0};
+    std::atomic<std::uint64_t> served_{0}, experts_{0}, busy_ns_{0};
     mutable std::mutex failure_mutex_;
     std::string failure_;
     std::thread thread_;

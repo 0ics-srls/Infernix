@@ -186,6 +186,7 @@ void CpuMissService::serve() {
             }
             std::atomic_thread_fence(std::memory_order_acquire);
             seen = sequence;
+            const auto seen_at   = std::chrono::steady_clock::now();
             const MissRequest& r = *request_;
             const Layer& layer   = layers_.at(static_cast<std::size_t>(r.layer));
             const int count      = r.jobs;
@@ -238,6 +239,9 @@ void CpuMissService::serve() {
             std::atomic_thread_fence(std::memory_order_release);
             *volatile_done = sequence;
             served_.fetch_add(1, std::memory_order_relaxed);
+            busy_ns_.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now() - seen_at).count()),
+                               std::memory_order_relaxed);
             experts_.fetch_add(static_cast<std::uint64_t>(count), std::memory_order_relaxed);
             last  = std::chrono::steady_clock::now();
             polls = 0;

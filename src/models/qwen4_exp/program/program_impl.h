@@ -2601,6 +2601,14 @@ private:
                           s.routed ? 100.0 * static_cast<double>(s.hits) / static_cast<double>(s.routed) : 0.0,
                           free_vram >> 20);
             diagnostic(text, DiagnosticLevel::Debug);
+            if (cpu_service_) {
+                const auto n = cpu_service_->served_requests_total();
+                std::snprintf(text, sizeof(text), "CPU expert service: since start %llu requests, %llu experts, %.1f us per request, %.2f s busy",
+                              static_cast<unsigned long long>(n), static_cast<unsigned long long>(cpu_service_->served_experts()),
+                              n ? 1e-3 * static_cast<double>(cpu_service_->busy_ns()) / static_cast<double>(n) : 0.0,
+                              1e-9 * static_cast<double>(cpu_service_->busy_ns()));
+                diagnostic(text, DiagnosticLevel::Debug);
+            }
             if (remote_) {
                 const auto r = remote_->stats();
                 std::snprintf(text, sizeof(text),
