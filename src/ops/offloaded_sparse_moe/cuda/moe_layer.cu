@@ -91,14 +91,26 @@ __device__ __forceinline__ int row_quad(const std::uint8_t* unit, int r, int q) 
 // of it into shared memory, so the whole slice is in flight at once instead of one 144-byte unit
 // per warp iteration; this matters most for records read zero-copy over PCIe.
 __device__ __forceinline__ void stage_async(const std::uint8_t* src, std::uint8_t* dst, int bytes) {
+#if INFERNIX_DEVICE_SM80
     for (int i = static_cast<int>(threadIdx.x) * 16; i < bytes; i += static_cast<int>(blockDim.x) * 16) {
         const auto s = static_cast<unsigned>(__cvta_generic_to_shared(dst + i));
         asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(src + i) : "memory");
     }
     asm volatile("cp.async.commit_group;\n" ::: "memory");
+#else
+    // sm_70 (the V100's expert service): plain 16-byte copies; the callers' barrier after
+    // stage_wait() publishes them to the CTA as it does the asynchronous ones.
+    for (int i = static_cast<int>(threadIdx.x) * 16; i < bytes; i += static_cast<int>(blockDim.x) * 16) {
+        *reinterpret_cast<uint4*>(dst + i) = __ldcg(reinterpret_cast<const uint4*>(src + i));
+    }
+#endif
 }
 
-__device__ __forceinline__ void stage_wait() { asm volatile("cp.async.wait_group 0;\n" ::: "memory"); }
+__device__ __forceinline__ void stage_wait() {
+#if INFERNIX_DEVICE_SM80
+    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+#endif
+}
 
 // A non-resident expert's host record (MoeExpertSource::host_table, else the pinned bank).
 __device__ __forceinline__ const std::uint8_t* host_record(const MoeExpertSource& source, int expert) {
@@ -1086,7 +1098,7 @@ __device__ void encode_a16_columns(Base base, int n, int length, A16Act* acts, i
     }
 #pragma unroll
     for (int c = 0; c < Columns; ++c) {
-        m[c] = __reduce_max_sync(0xFFFFFFFFU, m[c]);
+        m[c] = infernix_warp_max_u32(0xFFFFFFFFU, m[c]);
         if (lane == 0) { key[warp][c] = m[c]; }
     }
     __syncthreads();
@@ -1407,7 +1419,7 @@ __global__ void __launch_bounds__(kThreads)
         const int count = dispatch.offsets[expert + 1] - dispatch.offsets[expert];
         if (count <= max_width) { atomicAdd(&width_misses[(ssd ? 0 : kWidths) + count], 1); }
     }
-    own = __reduce_add_sync(0xFFFFFFFFU, own);
+    own = infernix_warp_add_i32(0xFFFFFFFFU, own);
     if (lane == 0) { atomicAdd(&misses, own); }
     __syncthreads();
     if (threadIdx.x == 0) {

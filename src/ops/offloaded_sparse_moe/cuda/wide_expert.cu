@@ -255,7 +255,7 @@ __global__ void __launch_bounds__(kEncodeXThreads)
     const auto* source = reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(t) * kHidden + 16 * b);
     std::uint16_t v[16];
     unpack16(source[0], source[1], v);
-    const unsigned key = __reduce_max_sync(0xFFFFFFFFU, a16_key(v));
+    const unsigned key = infernix_warp_max_u32(0xFFFFFFFFU, a16_key(v));
     if (b % 32 == 0) { keys[b / 32] = key; }
     __syncthreads();
     unsigned all = 0;
@@ -288,7 +288,7 @@ __global__ void __launch_bounds__(kEncodeWarps * 32)
         unpack16(source[2 * lane], source[2 * lane + 1], v0);
         const bool second = lane + 32 < kBlocks;
         if (second) { unpack16(source[2 * (lane + 32)], source[2 * (lane + 32) + 1], v1); }
-        const int e = a16_emax(__reduce_max_sync(0xFFFFFFFFU, max(a16_key(v0), a16_key(v1))));
+        const int e = a16_emax(infernix_warp_max_u32(0xFFFFFFFFU, max(a16_key(v0), a16_key(v1))));
         __syncwarp();
         store_a16_block(row, lane, v0, e);
         if (second) { store_a16_block(row, lane + 32, v1, e); }

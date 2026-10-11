@@ -9,9 +9,49 @@
 // the upstream code unchanged.
 
 #if defined(__CUDA_ARCH__)
+#define INFERNIX_DEVICE_SM80 (__CUDA_ARCH__ >= 800)
 #define INFERNIX_DEVICE_SM90 (__CUDA_ARCH__ >= 900)
 #define INFERNIX_DEVICE_SM120 (__CUDA_ARCH__ >= 1200)
 #else
+#define INFERNIX_DEVICE_SM80 1
 #define INFERNIX_DEVICE_SM90 1
 #define INFERNIX_DEVICE_SM120 1
 #endif
+
+// Warp reductions of sm_80 (__reduce_*_sync) with a shuffle tree below it (the V100's expert service
+// runs the expert kernels on sm_70). Integer max and sum are exact in either order.
+__device__ __forceinline__ unsigned infernix_warp_max_u32(unsigned mask, unsigned v) {
+#if INFERNIX_DEVICE_SM80
+    return __reduce_max_sync(mask, v);
+#else
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const unsigned o = __shfl_xor_sync(mask, v, offset);
+        v                = o > v ? o : v;
+    }
+    return v;
+#endif
+}
+
+__device__ __forceinline__ int infernix_warp_max_i32(unsigned mask, int v) {
+#if INFERNIX_DEVICE_SM80
+    return __reduce_max_sync(mask, v);
+#else
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const int o = __shfl_xor_sync(mask, v, offset);
+        v           = o > v ? o : v;
+    }
+    return v;
+#endif
+}
+
+__device__ __forceinline__ int infernix_warp_add_i32(unsigned mask, int v) {
+#if INFERNIX_DEVICE_SM80
+    return __reduce_add_sync(mask, v);
+#else
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) { v += __shfl_xor_sync(mask, v, offset); }
+    return v;
+#endif
+}
