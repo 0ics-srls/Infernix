@@ -157,7 +157,11 @@ enum class PassPhase : int { All = 0, Resident = 1, Staged = 2 };
 __device__ __forceinline__ const std::uint8_t* pass_record(PassPhase phase, const MoeExpertSource& source,
                                                            int expert, const std::uint8_t* const* job_records,
                                                            int job) {
-    if (phase == PassPhase::All) { return job_records[job]; }
+    if (phase == PassPhase::All) {
+        return source.all_resident
+                   ? source.frame_base + static_cast<std::uint64_t>(source.frames[expert]) * source.record_stride
+                   : job_records[job];
+    }
     const bool resident = source.frames[expert] >= 0;
     if (resident != (phase == PassPhase::Resident)) { return nullptr; }
     return resident ? source.frame_base + static_cast<std::uint64_t>(source.frames[expert]) * source.record_stride
@@ -1869,15 +1873,40 @@ __global__ void __launch_bounds__(kThreads)
     const moe::ExpertScales scales = source.scales[expert];
     if (scales.input_up != scales.input_gate) { return; }
     const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
-    // CTA y of kActPlaneSplit takes blocks [y * kSpan, (y + 1) * kSpan) of every entry of the job.
+    // CTA y of kActPlaneSplit takes blocks [y * kSpan, (y + 1) * kSpan) of every entry of the job,
+    // sixteen threads per block: quantize_a4_block's rule element by element (the block's amax by
+    // shuffles within the sixteen lanes, an order-free maximum), so every thread has one element.
     constexpr int kSpan = moe::kGateUpBlocks / kActPlaneSplit;
-    const int b0 = static_cast<int>(blockIdx.y) * kSpan;
-    for (int i = threadIdx.x; i < count * kSpan; i += blockDim.x) {
-        const int c = i / kSpan, b = b0 + i % kSpan;
-        const int t = dispatch.entries[first + c] / top_k;
-        const auto* v = reinterpret_cast<const std::uint16_t*>(x + static_cast<std::size_t>(t) * hidden + 16 * b);
-        plane[static_cast<std::size_t>(first + c) * moe::kGateUpBlocks + b] =
-            to_act(canon::quantize_a4_block(v, scales.input_gate));
+    const int b0        = static_cast<int>(blockIdx.y) * kSpan;
+    const int items     = count * kSpan * 16;
+    const float scale   = scales.input_gate;
+    for (int base = 0; base < items; base += blockDim.x) {
+        const int item   = base + static_cast<int>(threadIdx.x);
+        const bool live  = item < items;
+        const int block  = item / 16, j = item % 16;
+        const int c = block / kSpan, b = b0 + block % kSpan;
+        float v = 0.0F;
+        if (live) {
+            const int t = dispatch.entries[first + c] / top_k;
+            v = canon::bf16_to_f32(reinterpret_cast<const std::uint16_t*>(x + static_cast<std::size_t>(t) * hidden)[16 * b + j]);
+        }
+        float amax = canon::f32_from_bits(canon::f32_bits(v) & 0x7FFFFFFFU);
+#pragma unroll
+        for (int offset = 8; offset > 0; offset >>= 1) {
+            const float o = __shfl_xor_sync(0xFFFFFFFFU, amax, offset);
+            amax          = o > amax ? o : amax;
+        }
+        if (!live) { continue; }
+        const std::uint8_t s         = canon::e4m3_rn_satfinite(canon::div_rn(amax, canon::mul_rn(6.0F, scale)));
+        const std::int32_t scaled    = canon::e4m3_scaled(s);
+        int code = 0;
+        if (scaled != 0) {
+            const float d = canon::mul_rn(canon::e4m3_value(s), scale);
+            code          = canon::e2m1_x2(canon::e2m1_rn_satfinite(canon::div_rn(v, d)));
+        }
+        ActBlock* out = plane + static_cast<std::size_t>(first + c) * moe::kGateUpBlocks + b;
+        reinterpret_cast<std::int8_t*>(out->quads)[j] = static_cast<std::int8_t>(code);
+        if (j == 0) { out->scale = scaled; }
     }
 }
 
@@ -2286,7 +2315,7 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         check_launch("stage");
         const auto* xs = static_cast<const bf16*>(x.data);
         auto* out      = static_cast<bf16*>(outputs.data);
-        const int few = pass_width(x.ne[1]);
+        const int few = pass_width(source.job_columns > 0 ? std::min<int>(x.ne[1], source.job_columns) : x.ne[1]);
         launch_pass(few, xs, dispatch, source, top_k, job_records, flags, 0, max_jobs, layout, outputs.ne[1], out,
                     source.fork_stream, PassPhase::Staged);
         launch_pass(few, xs, dispatch, source, top_k, job_records, flags, 0, max_jobs, layout, outputs.ne[1], out, stream,
@@ -2308,13 +2337,16 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     unlanded.landing_slots   = 0;
     for (int base = 0; base < max_jobs; base += pass_jobs) {
         const int jobs = std::min(pass_jobs, max_jobs - base);
-        stage_kernel<<<source.staging_slots > 0 ? kStageCtas : 1, kThreads, 0, stream>>>(dispatch, unlanded, base, jobs,
-                                                                                       flags, job_records, fetch);
-        check_launch("stage");
+        if (!source.all_resident) {
+            stage_kernel<<<source.staging_slots > 0 ? kStageCtas : 1, kThreads, 0, stream>>>(dispatch, unlanded, base,
+                                                                                           jobs, flags, job_records, fetch);
+            check_launch("stage");
+        }
         // Calls of a few columns (decode, MTP verification) use the one-column kernels, which fit
         // two gate/up CTAs per SM; a job with several columns takes one pass per column over its
         // staged weights.
-        launch_pass(pass_width(x.ne[1]), static_cast<const bf16*>(x.data), dispatch, source, top_k,
+        launch_pass(pass_width(source.job_columns > 0 ? std::min<int>(x.ne[1], source.job_columns) : x.ne[1]),
+                    static_cast<const bf16*>(x.data), dispatch, source, top_k,
                     job_records, flags, base, jobs, layout, outputs.ne[1], static_cast<bf16*>(outputs.data), stream);
         if (wide) { moe::wide::run_pass(*wide, base / pass_jobs, stream); }
     }

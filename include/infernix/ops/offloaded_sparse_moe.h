@@ -195,6 +195,12 @@ struct MoeExpertSource {
     // The resident records' units are in the row-pair layout (ops/offloaded_sparse_moe/cuda/
     // remote_experts.h: the V100's copies). Only the sm_70 build of the multi-column kernels reads it.
     bool row_pair_units = false;
+    // The most columns any job of the call has (0: unknown, the call's columns); the narrow pass
+    // kernels are sized to it.
+    std::int32_t job_columns = 0;
+    // Every dispatched expert is resident in a frame (the V100's expert service): records resolve
+    // in the pass kernels and no stage kernel runs.
+    bool all_resident = false;
     // Optional overlap of staging with compute for calls of several passes (prefill chunks): the
     // slots are split in two halves and pass p+1 is staged on `overlap_stream` while pass p
     // computes. The stream and the five events (start, staged[2], consumed[2]) are caller-owned;

@@ -373,6 +373,10 @@ void RemoteExpertService::serve() {
                     source.activation    = options_.activation;
                     source.act_plane     = act_plane_;
                     source.row_pair_units = options_.row_pair_units;
+                    source.all_resident   = true;
+                    int widest = 0;
+                    for (int j = 0; j < jobs; ++j) { widest = std::max(widest, r.count[j]); }
+                    source.job_columns = widest;
                     const Tensor x(x_device_, DType::BF16, {kHidden, columns});
                     Tensor outputs(outputs_, DType::BF16, {kHidden, columns * top_k});
                     require_cuda(cudaEventRecord(marks[1], stream), "event");
