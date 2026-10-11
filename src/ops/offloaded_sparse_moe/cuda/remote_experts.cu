@@ -252,6 +252,8 @@ void RemoteExpertService::serve() {
         require_cuda(cudaSetDevice(options_.device), "cudaSetDevice");
         cudaStream_t stream = nullptr;
         require_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreate");
+        cudaEvent_t marks[4] = {};
+        for (auto& mark : marks) { require_cuda(cudaEventCreate(&mark), "cudaEventCreate"); }
         const std::uint32_t E      = options_.experts;
         const DispatchLayout d     = dispatch_layout(E);
         auto* volatile_sequence    = reinterpret_cast<volatile std::uint32_t*>(&request_->sequence);
@@ -320,6 +322,7 @@ void RemoteExpertService::serve() {
                 const std::size_t list = d.entries + static_cast<std::size_t>(entries);
                 std::memcpy(s + list, r.entry, sizeof(std::int32_t) * static_cast<std::size_t>(entries));
                 if (status == 0) {
+                    require_cuda(cudaEventRecord(marks[0], stream), "event");
                     require_cuda(cudaMemcpyAsync(dispatch_, s, (list + static_cast<std::size_t>(entries)) * sizeof(std::int32_t),
                                                  cudaMemcpyHostToDevice, stream),
                                  "upload dispatch");
@@ -342,13 +345,16 @@ void RemoteExpertService::serve() {
                     source.activation    = options_.activation;
                     const Tensor x(x_device_, DType::BF16, {kHidden, columns});
                     Tensor outputs(outputs_, DType::BF16, {kHidden, columns * top_k});
+                    require_cuda(cudaEventRecord(marks[1], stream), "event");
                     moe_experts(x, dispatch, source, top_k, jobs, workspace_, outputs, stream, true);
+                    require_cuda(cudaEventRecord(marks[2], stream), "event");
                     const int vectors = kHidden * 2 / 16;
                     const int blocks  = std::min(1024, (entries * vectors + 255) / 256);
                     gather_kernel<<<blocks, 256, 0, stream>>>(reinterpret_cast<const int4*>(outputs_),
                                                              dispatch_ + list, entries, vectors,
                                                              reinterpret_cast<int4*>(y_));
                     require_cuda(cudaGetLastError(), "gather");
+                    require_cuda(cudaEventRecord(marks[3], stream), "event");
                     enqueued = std::chrono::steady_clock::now();
                     cudaError_t state = cudaErrorNotReady;
                     while ((state = cudaStreamQuery(stream)) == cudaErrorNotReady) {
@@ -356,6 +362,14 @@ void RemoteExpertService::serve() {
                         relax();
                     }
                     require_cuda(state, "remote call");
+                    float upload = 0, compute = 0, gather = 0;
+                    (void)cudaEventElapsedTime(&upload, marks[0], marks[1]);
+                    (void)cudaEventElapsedTime(&compute, marks[1], marks[2]);
+                    (void)cudaEventElapsedTime(&gather, marks[2], marks[3]);
+                    const std::lock_guard<std::mutex> lock(mutex_);
+                    stats_.upload_ms += upload;
+                    stats_.experts_ms += compute;
+                    stats_.gather_ms += gather;
                 }
             }
             *volatile_status = status;
@@ -377,6 +391,7 @@ void RemoteExpertService::serve() {
             last  = std::chrono::steady_clock::now();
             polls = 0;
         }
+        for (auto& mark : marks) { cudaEventDestroy(mark); }
         cudaStreamDestroy(stream);
     } catch (const std::exception& error) {
         record_failure(error.what());

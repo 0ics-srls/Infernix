@@ -69,6 +69,8 @@ public:
         std::uint64_t busy_ns  = 0; // request seen to answer written
         std::uint64_t enqueue_ns = 0; // request seen to the last launch enqueued (host work)
         std::uint64_t wait_ns    = 0; // last launch enqueued to the stream's completion (the remote GPU)
+        // GPU time on the remote stream (events): uploads, the experts, the gather into mapped y.
+        double upload_ms = 0, experts_ms = 0, gather_ms = 0;
     };
     [[nodiscard]] Stats stats() const;
     // Why the service stopped serving; empty while it serves (the main GPU's wait then times out).

@@ -2613,6 +2613,12 @@ private:
                               r.requests ? 1e-3 * static_cast<double>(r.wait_ns) / static_cast<double>(r.requests) : 0.0,
                               1e-9 * static_cast<double>(r.busy_ns));
                 diagnostic(text, DiagnosticLevel::Debug);
+                std::snprintf(text, sizeof(text),
+                              "second GPU: per request on its stream %.1f us uploads, %.1f us experts, %.1f us gather",
+                              r.requests ? 1e3 * r.upload_ms / static_cast<double>(r.requests) : 0.0,
+                              r.requests ? 1e3 * r.experts_ms / static_cast<double>(r.requests) : 0.0,
+                              r.requests ? 1e3 * r.gather_ms / static_cast<double>(r.requests) : 0.0);
+                diagnostic(text, DiagnosticLevel::Debug);
             }
             if (tier_) {
                 // The tier's counters as of the last round boundary.
