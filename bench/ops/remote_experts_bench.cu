@@ -40,6 +40,7 @@ int main(int argc, char** argv) {
     o.scales = {scales.data(), scales.data()};
     o.max_records = 64;
     RemoteExpertService service(o);
+    std::fprintf(stderr, "service: capacity %u\n", service.capacity());
 
     std::mt19937 rng(7);
     std::vector<std::uint32_t> keys;
@@ -55,6 +56,7 @@ int main(int argc, char** argv) {
             for (int b = 128; b < 144; ++b) { d[u + b] = 0x38; }
         }
     });
+    std::fprintf(stderr, "loaded %u\n", service.held());
     const MoeRemoteChannel ch = service.channel(0);
     auto* x = ch.x;
     for (int i = 0; i < 2560 * columns; ++i) {
