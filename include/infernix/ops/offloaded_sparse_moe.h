@@ -192,6 +192,9 @@ struct MoeExpertSource {
     // moe_act_plane_bytes(entries) bytes here, and the gate/up CTAs read it instead of each
     // quantizing the column again. Same A4 blocks, so no bit changes. Null: each CTA quantizes.
     void* act_plane = nullptr;
+    // The resident records' units are in the row-pair layout (ops/offloaded_sparse_moe/cuda/
+    // remote_experts.h: the V100's copies). Only the sm_70 build of the multi-column kernels reads it.
+    bool row_pair_units = false;
     // Optional overlap of staging with compute for calls of several passes (prefill chunks): the
     // slots are split in two halves and pass p+1 is staged on `overlap_stream` while pass p
     // computes. The stream and the five events (start, staged[2], consumed[2]) are caller-owned;

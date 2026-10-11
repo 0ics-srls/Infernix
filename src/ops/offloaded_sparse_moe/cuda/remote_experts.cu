@@ -57,6 +57,25 @@ __global__ void gather_kernel(const int4* __restrict__ outputs, const std::int32
     }
 }
 
+// Every 144-byte unit of `records` records into the row-pair layout (MoeExpertSource::row_pair_units):
+// code byte 32q + 4i + j moves to 16i + 4q + j; the 16 scale bytes stay.
+__global__ void row_pair_kernel(std::uint8_t* __restrict__ records, std::size_t units) {
+    const std::size_t u = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (u >= units) { return; }
+    std::uint8_t* unit = records + u * kUnitBytes;
+    std::uint32_t in[32], out[32];
+#pragma unroll
+    for (int w = 0; w < 32; ++w) { in[w] = reinterpret_cast<const std::uint32_t*>(unit)[w]; }
+    // word 8q + i (bytes 32q + 4i .. + 3) becomes word 4i + q
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) { out[4 * i + q] = in[8 * q + i]; }
+    }
+#pragma unroll
+    for (int w = 0; w < 32; ++w) { reinterpret_cast<std::uint32_t*>(unit)[w] = out[w]; }
+}
+
 // The dispatch block's layout on the remote GPU (and in its pinned staging): MoeDispatch's arrays
 // for E experts and kMaxRemoteEntries entries, then the request's entry list in its own order.
 struct DispatchLayout {
@@ -197,6 +216,13 @@ void RemoteExpertService::load(std::span<const std::uint32_t> keys, const Read& 
             require_cuda(cudaMemcpy(records_ + base * options_.record_stride, bytes, count * options_.record_stride,
                                     cudaMemcpyHostToDevice),
                          "upload records");
+            if (options_.row_pair_units) {
+                static_assert(kRecordBytes % kUnitBytes == 0);
+                const std::size_t units = count * options_.record_stride / kUnitBytes;
+                row_pair_kernel<<<static_cast<unsigned>((units + 255) / 256), 256>>>(
+                    records_ + base * options_.record_stride, units);
+                require_cuda(cudaGetLastError(), "row pair layout");
+            }
             for (std::size_t i = 0; i < count; ++i) {
                 const std::uint32_t key = keys[base + i];
                 slot_of_[key]           = static_cast<std::int32_t>(base + i);
@@ -346,6 +372,7 @@ void RemoteExpertService::serve() {
                     source.scales        = scales_ + static_cast<std::size_t>(layer) * E;
                     source.activation    = options_.activation;
                     source.act_plane     = act_plane_;
+                    source.row_pair_units = options_.row_pair_units;
                     const Tensor x(x_device_, DType::BF16, {kHidden, columns});
                     Tensor outputs(outputs_, DType::BF16, {kHidden, columns * top_k});
                     require_cuda(cudaEventRecord(marks[1], stream), "event");

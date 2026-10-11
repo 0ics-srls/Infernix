@@ -730,6 +730,72 @@ __device__ void unit_sums(const std::uint8_t* matrix, int blocks, int rg0, const
     }
 }
 
+// unit_sums over row-pair units (MoeExpertSource::row_pair_units): lane L of a warp reads row pair
+// i = L % 8 of unit 4 * iteration + L / 8 of its share with one 16-byte load, accumulates rows i and
+// i + 8 over its units, and the four lanes of a row pair are summed at the end, so lanes 0..15 hold
+// row (lane & 15) of each group as unit_sums leaves them. Same integers as unit_sums.
+template <int Groups, int Columns>
+__device__ void unit_sums_rp(const std::uint8_t* matrix, int blocks, int rg0, const ActBlock* acts, int n,
+                             std::int64_t (&s)[Groups][Columns]) {
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int i = lane & 7, sub = lane >> 3;
+    std::int64_t lo[Groups][Columns], hi[Groups][Columns];
+#pragma unroll
+    for (int g = 0; g < Groups; ++g) {
+#pragma unroll
+        for (int c = 0; c < Columns; ++c) { lo[g][c] = hi[g][c] = 0; }
+    }
+    const int units = Groups * blocks;
+    for (int u0 = 4 * warp; u0 < units; u0 += 4 * kWarps) {
+        const int u = u0 + sub;
+        if (u < units) {
+            const int g = u / blocks, b = u % blocks;
+            const std::uint8_t* unit = matrix + (static_cast<std::size_t>(rg0 + g) * blocks + b) * moe::kUnitBytes;
+            const uint4 codes = __ldg(reinterpret_cast<const uint4*>(unit + 16 * i));
+            const int sw_lo   = canon::e4m3_scaled(__ldg(unit + 128 + i));
+            const int sw_hi   = canon::e4m3_scaled(__ldg(unit + 128 + 8 + i));
+            const std::uint32_t word[4] = {codes.x, codes.y, codes.z, codes.w};
+            int d_lo[4], d_hi[4];
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                d_lo[q] = static_cast<int>(canon::e2m1_x2_quad(word[q] & 0x0F0F0F0FU));
+                d_hi[q] = static_cast<int>(canon::e2m1_x2_quad((word[q] >> 4) & 0x0F0F0F0FU));
+            }
+#pragma unroll
+            for (int c = 0; c < Columns; ++c) {
+                if (c < n) {
+                    const ActBlock& a = acts[c * blocks + b];
+                    int p_lo = 0, p_hi = 0;
+#pragma unroll
+                    for (int q = 0; q < 4; ++q) {
+                        p_lo = __dp4a(d_lo[q], a.quads[q], p_lo);
+                        p_hi = __dp4a(d_hi[q], a.quads[q], p_hi);
+                    }
+#pragma unroll
+                    for (int gg = 0; gg < Groups; ++gg) {
+                        if (gg == g) {
+                            lo[gg][c] += static_cast<std::int64_t>(p_lo * sw_lo) * a.scale;
+                            hi[gg][c] += static_cast<std::int64_t>(p_hi * sw_hi) * a.scale;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // The four lanes of row pair i (sub = 0..3) hold partial sums of different units.
+#pragma unroll
+    for (int g = 0; g < Groups; ++g) {
+#pragma unroll
+        for (int c = 0; c < Columns; ++c) {
+            lo[g][c] += __shfl_xor_sync(0xFFFFFFFFU, lo[g][c], 8);
+            lo[g][c] += __shfl_xor_sync(0xFFFFFFFFU, lo[g][c], 16);
+            hi[g][c] += __shfl_xor_sync(0xFFFFFFFFU, hi[g][c], 8);
+            hi[g][c] += __shfl_xor_sync(0xFFFFFFFFU, hi[g][c], 16);
+            s[g][c] = lane < 8 ? lo[g][c] : hi[g][c]; // lane 8 + i holds row 8 + i
+        }
+    }
+}
+
 // ------------------------------------------------- the one-column kernels' half2 unit products
 //
 // A unit's code byte 32q + 4i + j holds rows i (low nibble) and i + 8 (high nibble) at k = 4q + j.
@@ -975,6 +1041,11 @@ __global__ void __launch_bounds__(kThreads, Columns == 1 ? 2 : (Columns <= 5 ? 4
             if constexpr (Columns == 1) {
                 unit_sums_one<kGateUpGroups>(weights, moe::kGateUpBlocks, sm.acts, s);
             } else {
+#if !INFERNIX_DEVICE_SM80
+                if (source.row_pair_units) {
+                    unit_sums_rp<kGateUpGroups, Columns>(weights, moe::kGateUpBlocks, 0, sm.acts, n, s);
+                } else
+#endif
                 unit_sums<kGateUpGroups, Columns>(weights, moe::kGateUpBlocks, 0, sm.acts, n, s);
             }
             __syncthreads(); // every warp has read sm.acts before sm.partial overwrites it
@@ -1096,6 +1167,11 @@ __global__ void __launch_bounds__(kThreads, Columns <= 5 && Columns > 1 ? 4 : 1)
         if constexpr (Columns == 1) {
             unit_sums_one<kDownGroups>(weights, moe::kDownBlocks, sm.acts, s);
         } else {
+#if !INFERNIX_DEVICE_SM80
+            if (source.row_pair_units) {
+                unit_sums_rp<kDownGroups, Columns>(weights, moe::kDownBlocks, 0, sm.acts, n, s);
+            } else
+#endif
             unit_sums<kDownGroups, Columns>(weights, moe::kDownBlocks, 0, sm.acts, n, s);
         }
         if (lane < 16) {

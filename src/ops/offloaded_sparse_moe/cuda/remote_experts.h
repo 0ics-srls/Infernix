@@ -44,6 +44,9 @@ public:
         std::uint64_t reserve_bytes = 1536ULL << 20;
         // At most this many records (0: as many as fit).
         std::uint32_t max_records = 0;
+        // Copies in the row-pair unit layout the sm_70 kernels read with 16-byte loads
+        // (MoeExpertSource::row_pair_units); requires record_stride == kRecordBytes.
+        bool row_pair_units = true;
     };
 
     explicit RemoteExpertService(Options options);
