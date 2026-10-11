@@ -50,9 +50,9 @@ namespace infernix::ops::offloaded_moe {
 // equal the CPU engine's bits. The host side asks wide_route_available() before planning the route.
 INFERNIX_WIDE_HD bool wide_route(int columns, const ExpertScales& scales) {
 #if !INFERNIX_DEVICE_SM120
-    (void)columns;
-    (void)scales;
-    return false;
+    // Below sm_120 the wide route is the WMMA one (moe_layer.cu, launch_wmma_pass), A4 experts only:
+    // W4A16 experts (zero input scales) keep the exact narrow route at every width.
+    return columns > kMaxColumns && scales.input_gate == scales.input_up && scales.input_gate != 0.0F;
 #else
     return columns > kMaxColumns && scales.input_gate == scales.input_up;
 #endif
